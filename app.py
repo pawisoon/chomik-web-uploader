@@ -7,26 +7,20 @@ import threading
 from functools import wraps
 from flask import Flask, request, redirect, render_template_string, Response, session
 import subprocess
-import shutil
 
-UPLOAD_FOLDER = 'uploads'
+BROWSE_FOLDER = '/app/browse'  # Read-only folder mounted from Synology
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.secret_key = os.environ.get('SECRET_KEY', 'default-secret-key-change-me')
 
 # Password security setup
 PASSWORD_HASH = os.environ.get('PANEL_PASSWORD_HASH', '')
 PANEL_PASSWORD = os.environ.get('PANEL_PASSWORD', '')
 
-# If plain password is set, we hash it on startup
 if PANEL_PASSWORD and not PASSWORD_HASH:
     PASSWORD_HASH = hashlib.sha256(PANEL_PASSWORD.encode()).hexdigest()
 
 upload_status = {}
 upload_lock = threading.Lock()
-
-if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
 
 def verify_password(password):
     """Verify password using constant-time comparison"""
@@ -43,6 +37,29 @@ def login_required(f):
             return redirect('/login')
         return f(*args, **kwargs)
     return decorated_function
+
+def get_files_from_browse_folder():
+    """Get list of files from browse folder"""
+    files = []
+    try:
+        if os.path.exists(BROWSE_FOLDER):
+            for root, dirs, filenames in os.walk(BROWSE_FOLDER):
+                for filename in filenames:
+                    filepath = os.path.join(root, filename)
+                    relative_path = os.path.relpath(filepath, BROWSE_FOLDER)
+                    try:
+                        size = os.path.getsize(filepath)
+                        files.append({
+                            'name': filename,
+                            'path': relative_path,
+                            'full_path': filepath,
+                            'size': size
+                        })
+                    except:
+                        pass
+    except Exception as e:
+        app.logger.error('Error reading browse folder: ' + str(e))
+    return files
 
 HTML_LOGIN = u"""
 <!doctype html>
@@ -174,7 +191,7 @@ HTML_FORM = u"""
         }
         body {
             font-family: Arial, sans-serif;
-            max-width: 900px;
+            max-width: 1200px;
             margin: 0 auto;
             padding: 20px;
             background: #f5f5f5;
@@ -212,28 +229,15 @@ HTML_FORM = u"""
         h2 {
             color: #555;
             margin-top: 30px;
+            margin-bottom: 15px;
             font-size: 18px;
         }
-        .upload-area {
-            border: 2px dashed #ccc;
-            border-radius: 8px;
-            padding: 30px;
-            text-align: center;
-            cursor: pointer;
-            margin: 20px 0;
-            transition: all 0.3s;
-            background: #fafafa;
-        }
-        .upload-area:hover {
-            border-color: #666;
-            background: #f0f0f0;
-        }
-        .upload-area.drag-over {
-            border-color: #007bff;
-            background: #e7f3ff;
-        }
-        input[type="file"] {
-            display: none;
+        .info-box {
+            background: #e3f2fd;
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            border-left: 4px solid #2196f3;
         }
         .button-group {
             margin: 15px 0;
@@ -263,31 +267,53 @@ HTML_FORM = u"""
         .retry-btn:hover {
             background: #ffb300;
         }
-        .selected-files {
-            background: #f9f9f9;
-            padding: 15px;
+        .file-browser {
+            max-height: 400px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
             border-radius: 4px;
             margin: 20px 0;
-            border: 1px solid #ddd;
-            min-height: 40px;
         }
-        .file-chip {
-            display: inline-block;
-            background: #e3f2fd;
-            border: 1px solid #90caf9;
-            border-radius: 20px;
-            padding: 8px 12px;
-            margin: 5px 5px 5px 0;
-            font-size: 14px;
+        .file-row {
+            padding: 12px;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            align-items: center;
+            transition: background 0.2s;
         }
-        .file-chip .remove {
+        .file-row:hover {
+            background: #f9f9f9;
+        }
+        .file-row input[type="checkbox"] {
+            margin-right: 12px;
+            width: 18px;
+            height: 18px;
             cursor: pointer;
-            margin-left: 8px;
-            color: #d32f2f;
-            font-weight: bold;
         }
-        .file-chip .remove:hover {
-            color: #b71c1c;
+        .file-info {
+            flex: 1;
+        }
+        .file-name-browser {
+            font-weight: 500;
+            color: #333;
+            word-break: break-all;
+        }
+        .file-path {
+            font-size: 12px;
+            color: #999;
+            margin-top: 4px;
+        }
+        .file-size-browser {
+            font-size: 12px;
+            color: #666;
+            margin-left: 15px;
+            white-space: nowrap;
+        }
+        .select-all-row {
+            padding: 12px;
+            background: #f5f5f5;
+            border-bottom: 2px solid #ddd;
+            font-weight: bold;
         }
         .file-list {
             margin-top: 30px;
@@ -363,17 +389,18 @@ HTML_FORM = u"""
             background: #fff3cd;
             color: #856404;
         }
-        .no-files-text {
-            color: #999;
-            font-style: italic;
-            font-size: 14px;
-        }
         .retry-section {
             margin-top: 10px;
             display: none;
         }
         .retry-section.show {
             display: block;
+        }
+        .no-files {
+            padding: 40px;
+            text-align: center;
+            color: #999;
+            font-style: italic;
         }
     </style>
 </head>
@@ -384,25 +411,26 @@ HTML_FORM = u"""
     </div>
     
     <div class="container">
+        <div class="info-box">
+            <strong>ℹ️ Informacja:</strong> Wybierz pliki z katalogu Synology, które chcesz wysłać na Chomika. 
+            Pliki nie są kopiowane - wysyłane są bezpośrednio z Twojego serwera.
+        </div>
+        
         <div id="messages" class="messages"></div>
         
-        <form id="uploadForm" enctype="multipart/form-data">
-            <div class="upload-area" id="uploadArea">
-                <p><strong>Kliknij tutaj lub przeciągnij pliki</strong></p>
-                <p style="font-size: 12px; color: #999;">Możesz wybrać wiele plików naraz</p>
-                <input type="file" id="fileInput" name="files" multiple>
+        <h2>Dostępne pliki na Synology:</h2>
+        <div class="file-browser" id="fileBrowser">
+            <div class="select-all-row">
+                <input type="checkbox" id="selectAll" onchange="toggleSelectAll()">
+                <label for="selectAll" style="display: inline; cursor: pointer;">Zaznacz wszystkie</label>
             </div>
-            
-            <h2>Wybrane pliki do wysłania:</h2>
-            <div id="selectedFiles" class="selected-files">
-                <span class="no-files-text">Nie wybrano żadnych plików</span>
-            </div>
-            
-            <div class="button-group">
-                <button type="submit" id="submitBtn" disabled>Wyślij pliki</button>
-                <button type="button" id="clearBtn" onclick="clearSelection()">Wyczyść wybór</button>
-            </div>
-        </form>
+            <div id="fileList"></div>
+        </div>
+        
+        <div class="button-group">
+            <button id="uploadBtn" onclick="uploadSelected()" disabled>Wyślij zaznaczone pliki</button>
+            <button onclick="refreshFileList()">Odśwież listę</button>
+        </div>
         
         <div class="file-list">
             <h2>Status uploadów:</h2>
@@ -414,77 +442,91 @@ HTML_FORM = u"""
     </div>
 
     <script>
+        let availableFiles = [];
         let failedFiles = [];
         
-        const uploadArea = document.getElementById('uploadArea');
-        const fileInput = document.getElementById('fileInput');
-        const uploadForm = document.getElementById('uploadForm');
         const statusList = document.getElementById('statusList');
         const messagesDiv = document.getElementById('messages');
-        const selectedFilesDiv = document.getElementById('selectedFiles');
-        const submitBtn = document.getElementById('submitBtn');
+        const uploadBtn = document.getElementById('uploadBtn');
         const retrySection = document.getElementById('retrySection');
+        const fileListDiv = document.getElementById('fileList');
 
-        uploadArea.addEventListener('click', () => fileInput.click());
-        
-        uploadArea.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            uploadArea.classList.add('drag-over');
-        });
-        
-        uploadArea.addEventListener('dragleave', () => {
-            uploadArea.classList.remove('drag-over');
-        });
-        
-        uploadArea.addEventListener('drop', (e) => {
-            e.preventDefault();
-            uploadArea.classList.remove('drag-over');
-            fileInput.files = e.dataTransfer.files;
-            updateSelectedFiles();
+        // Load files on page load
+        window.addEventListener('load', () => {
+            refreshFileList();
         });
 
-        fileInput.addEventListener('change', updateSelectedFiles);
+        function refreshFileList() {
+            fetch('/api/files')
+                .then(response => response.json())
+                .then(data => {
+                    availableFiles = data.files;
+                    renderFileList();
+                })
+                .catch(error => {
+                    showMessage('Błąd pobierania listy plików: ' + error.message, 'error');
+                });
+        }
 
-        function updateSelectedFiles() {
-            const files = fileInput.files;
-            selectedFilesDiv.innerHTML = '';
+        function renderFileList() {
+            fileListDiv.innerHTML = '';
             
-            if (files.length === 0) {
-                selectedFilesDiv.innerHTML = '<span class="no-files-text">Nie wybrano żadnych plików</span>';
-                submitBtn.disabled = true;
-            } else {
-                submitBtn.disabled = false;
-                for (let file of files) {
-                    const chip = document.createElement('div');
-                    chip.className = 'file-chip';
-                    const sizeKB = (file.size / 1024).toFixed(2);
-                    chip.innerHTML = `
-                        ${file.name} (${sizeKB} KB)
-                        <span class="remove" onclick="removeFile('${file.name}')">✕</span>
-                    `;
-                    selectedFilesDiv.appendChild(chip);
-                }
+            if (availableFiles.length === 0) {
+                fileListDiv.innerHTML = '<div class="no-files">Brak plików w katalogu</div>';
+                return;
             }
-        }
 
-        function removeFile(fileName) {
-            const files = Array.from(fileInput.files).filter(f => f.name !== fileName);
-            const dataTransfer = new DataTransfer();
-            files.forEach(file => dataTransfer.items.add(file));
-            fileInput.files = dataTransfer.files;
-            updateSelectedFiles();
-        }
-
-        function clearSelection() {
-            fileInput.value = '';
-            updateSelectedFiles();
-        }
-
-        uploadForm.addEventListener('submit', async (e) => {
-            e.preventDefault();
+            availableFiles.forEach((file, index) => {
+                const row = document.createElement('div');
+                row.className = 'file-row';
+                const sizeKB = (file.size / 1024).toFixed(2);
+                const sizeMB = (file.size / 1024 / 1024).toFixed(2);
+                const sizeDisplay = file.size > 1024 * 1024 ? sizeMB + ' MB' : sizeKB + ' KB';
+                
+                row.innerHTML = `
+                    <input type="checkbox" id="file-${index}" onchange="updateUploadButton()">
+                    <div class="file-info">
+                        <div class="file-name-browser">${file.name}</div>
+                        <div class="file-path">${file.path}</div>
+                    </div>
+                    <div class="file-size-browser">${sizeDisplay}</div>
+                `;
+                fileListDiv.appendChild(row);
+            });
             
-            const files = fileInput.files;
-            if (files.length === 0) {
+            updateUploadButton();
+        }
+
+        function toggleSelectAll() {
+            const selectAll = document.getElementById('selectAll');
+            const checkboxes = fileListDiv.querySelectorAll('input[type="checkbox"]');
+            checkboxes.forEach(cb => {
+                cb.checked = selectAll.checked;
+            });
+            updateUploadButton();
+        }
+
+        function updateUploadButton() {
+            const checkboxes = fileListDiv.querySelectorAll('input[type="checkbox"]');
+            const anyChecked = Array.from(checkboxes).some(cb => cb.checked);
+            uploadBtn.disabled = !anyChecked;
+        }
+
+        function getSelectedFiles() {
+            const selected = [];
+            const checkboxes = fileListDiv.querySelectorAll('input[type="checkbox"]');
+            checkboxes.forEach((cb, index) => {
+                if (cb.checked) {
+                    selected.push(availableFiles[index]);
+                }
+            });
+            return selected;
+        }
+
+        async function uploadSelected() {
+            const selectedFiles = getSelectedFiles();
+            
+            if (selectedFiles.length === 0) {
                 showMessage('Nie wybrano żadnych plików', 'error');
                 return;
             }
@@ -494,17 +536,13 @@ HTML_FORM = u"""
             failedFiles = [];
             retrySection.classList.remove('show');
 
-            for (let file of files) {
+            for (let file of selectedFiles) {
                 addFileStatus(file.name, file.size);
             }
 
-            for (let i = 0; i < files.length; i++) {
-                const file = files[i];
-                const formData = new FormData();
-                formData.append('file', file);
-                
+            for (let file of selectedFiles) {
                 try {
-                    await uploadFile(file.name, formData, i, files.length);
+                    await uploadFile(file);
                 } catch (error) {
                     updateFileStatus(file.name, 'error', 'Błąd: ' + error.message);
                     failedFiles.push(file.name);
@@ -514,19 +552,19 @@ HTML_FORM = u"""
             if (failedFiles.length > 0) {
                 retrySection.classList.add('show');
             }
-
-            fileInput.value = '';
-            updateSelectedFiles();
-        });
+        }
 
         function addFileStatus(fileName, fileSize) {
             const statusItem = document.createElement('div');
             statusItem.className = 'file-item pending';
             statusItem.id = 'status-' + fileName;
             const sizeKB = (fileSize / 1024).toFixed(2);
+            const sizeMB = (fileSize / 1024 / 1024).toFixed(2);
+            const sizeDisplay = fileSize > 1024 * 1024 ? sizeMB + ' MB' : sizeKB + ' KB';
+            
             statusItem.innerHTML = `
                 <div class="file-name">${fileName}</div>
-                <div class="file-size">Rozmiar: ${sizeKB} KB</div>
+                <div class="file-size">Rozmiar: ${sizeDisplay}</div>
                 <div class="progress-bar">
                     <div class="progress-fill" id="progress-${fileName}">0%</div>
                 </div>
@@ -567,159 +605,49 @@ HTML_FORM = u"""
             }
         }
 
-        function uploadFile(fileName, formData, index, total) {
+        function uploadFile(file) {
             return new Promise((resolve, reject) => {
-                const xhr = new XMLHttpRequest();
+                updateFileStatus(file.name, 'uploading', 'Wysyłanie na Chomika...');
                 
-                xhr.upload.addEventListener('progress', (e) => {
-                    if (e.lengthComputable) {
-                        const percentComplete = Math.round((e.loaded / e.total) * 100);
-                        updateProgress(fileName, percentComplete);
-                        updateFileStatus(fileName, 'uploading', 'Upload: ' + percentComplete + '%');
-                    }
-                });
-
-                xhr.addEventListener('load', () => {
-                    if (xhr.status === 200) {
-                        try {
-                            const response = JSON.parse(xhr.responseText);
-                            if (response.success) {
-                                updateFileStatus(fileName, 'success', 'Przesłano pomyślnie na Chomika!');
-                                showMessage('✓ ' + fileName + ' - przesłano pomyślnie', 'success');
-                                failedFiles = failedFiles.filter(f => f !== fileName);
-                            } else {
-                                updateFileStatus(fileName, 'error', 'Błąd: ' + (response.message || 'Nieznany błąd'));
-                                showMessage('✗ ' + fileName + ' - ' + (response.message || 'Błąd uploadu'), 'error');
-                                if (!failedFiles.includes(fileName)) {
-                                    failedFiles.push(fileName);
-                                }
-                            }
-                        } catch (e) {
-                            updateFileStatus(fileName, 'error', 'Błąd parsowania odpowiedzi');
-                            showMessage('✗ ' + fileName + ' - Błąd parsowania odpowiedzi', 'error');
-                            if (!failedFiles.includes(fileName)) {
-                                failedFiles.push(fileName);
-                            }
-                        }
+                fetch('/api/upload', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        filepath: file.full_path,
+                        filename: file.name
+                    })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        updateFileStatus(file.name, 'success', 'Przesłano pomyślnie na Chomika!');
+                        showMessage('✓ ' + file.name + ' - przesłano pomyślnie', 'success');
+                        failedFiles = failedFiles.filter(f => f !== file.name);
                     } else {
-                        updateFileStatus(fileName, 'error', 'Błąd: ' + xhr.statusText);
-                        showMessage('✗ ' + fileName + ' - Błąd HTTP ' + xhr.status, 'error');
-                        if (!failedFiles.includes(fileName)) {
-                            failedFiles.push(fileName);
+                        updateFileStatus(file.name, 'error', 'Błąd: ' + (data.message || 'Nieznany błąd'));
+                        showMessage('✗ ' + file.name + ' - ' + (data.message || 'Błąd uploadu'), 'error');
+                        if (!failedFiles.includes(file.name)) {
+                            failedFiles.push(file.name);
                         }
                     }
                     resolve();
-                });
-
-                xhr.addEventListener('error', () => {
-                    updateFileStatus(fileName, 'error', 'Błąd połączenia');
-                    showMessage('✗ ' + fileName + ' - Błąd połączenia', 'error');
-                    if (!failedFiles.includes(fileName)) {
-                        failedFiles.push(fileName);
+                })
+                .catch(error => {
+                    updateFileStatus(file.name, 'error', 'Błąd połączenia: ' + error.message);
+                    showMessage('✗ ' + file.name + ' - Błąd połączenia', 'error');
+                    if (!failedFiles.includes(file.name)) {
+                        failedFiles.push(file.name);
                     }
-                    reject(new Error('Network error'));
+                    reject(error);
                 });
-
-                xhr.addEventListener('abort', () => {
-                    updateFileStatus(fileName, 'error', 'Upload anulowany');
-                    if (!failedFiles.includes(fileName)) {
-                        failedFiles.push(fileName);
-                    }
-                    reject(new Error('Upload aborted'));
-                });
-
-                xhr.open('POST', '/upload', true);
-                xhr.send(formData);
             });
         }
 
-        async function retryFailed() {
-            if (failedFiles.length === 0) {
-                showMessage('Brak plików do ponownego wysłania', 'error');
-                return;
-            }
-
-            messagesDiv.innerHTML = '';
-            const filesToRetry = [...failedFiles];
-            failedFiles = [];
-
-            showMessage('Ponowne wysyłanie ' + filesToRetry.length + ' plików...', 'pending');
-
-            for (let fileName of filesToRetry) {
-                const statusItem = document.getElementById('status-' + fileName);
-                if (statusItem) {
-                    statusItem.remove();
-                }
-                addFileStatus(fileName, 0);
-                
-                const formData = new FormData();
-                const fileBlob = new Blob();
-                formData.append('file', fileBlob, fileName);
-                
-                try {
-                    await uploadFileRetry(fileName, formData);
-                } catch (error) {
-                    updateFileStatus(fileName, 'error', 'Błąd: ' + error.message);
-                    if (!failedFiles.includes(fileName)) {
-                        failedFiles.push(fileName);
-                    }
-                }
-            }
-
-            if (failedFiles.length === 0) {
-                retrySection.classList.remove('show');
-                showMessage('Wszystkie pliki przesłano pomyślnie!', 'success');
-            } else {
-                retrySection.classList.add('show');
-                showMessage('Nadal ' + failedFiles.length + ' plików się nie powiodło', 'error');
-            }
-        }
-
-        function uploadFileRetry(fileName, formData) {
-            return new Promise((resolve, reject) => {
-                const xhr = new XMLHttpRequest();
-                
-                xhr.addEventListener('load', () => {
-                    if (xhr.status === 200) {
-                        try {
-                            const response = JSON.parse(xhr.responseText);
-                            if (response.success) {
-                                updateFileStatus(fileName, 'success', 'Przesłano pomyślnie na Chomika! (retry)');
-                                showMessage('✓ ' + fileName + ' - przesłano pomyślnie (retry)', 'success');
-                                failedFiles = failedFiles.filter(f => f !== fileName);
-                            } else {
-                                updateFileStatus(fileName, 'error', 'Błąd: ' + (response.message || 'Nieznany błąd'));
-                                showMessage('✗ ' + fileName + ' - ' + (response.message || 'Błąd uploadu'), 'error');
-                                if (!failedFiles.includes(fileName)) {
-                                    failedFiles.push(fileName);
-                                }
-                            }
-                        } catch (e) {
-                            updateFileStatus(fileName, 'error', 'Błąd parsowania odpowiedzi');
-                            if (!failedFiles.includes(fileName)) {
-                                failedFiles.push(fileName);
-                            }
-                        }
-                    } else {
-                        updateFileStatus(fileName, 'error', 'Błąd: ' + xhr.statusText);
-                        if (!failedFiles.includes(fileName)) {
-                            failedFiles.push(fileName);
-                        }
-                    }
-                    resolve();
-                });
-
-                xhr.addEventListener('error', () => {
-                    updateFileStatus(fileName, 'error', 'Błąd połączenia');
-                    if (!failedFiles.includes(fileName)) {
-                        failedFiles.push(fileName);
-                    }
-                    reject(new Error('Network error'));
-                });
-
-                xhr.open('POST', '/upload', true);
-                xhr.send(formData);
-            });
+        function retryFailed() {
+            // Retry implementation for failed files
+            showMessage('Funkcja retry w rozwoju', 'info');
         }
 
         function showMessage(message, type) {
@@ -756,26 +684,36 @@ def logout():
     session.pop('logged_in', None)
     return redirect('/login')
 
-@app.route('/', methods=['GET', 'POST'])
+@app.route('/', methods=['GET'])
 @login_required
 def index():
-    if request.method == 'POST':
-        return redirect('/')
     return render_template_string(HTML_FORM)
 
-@app.route('/upload', methods=['POST'])
+@app.route('/api/files', methods=['GET'])
 @login_required
-def upload():
+def api_files():
+    """Return list of files from browse folder"""
+    files = get_files_from_browse_folder()
+    return json_response({'files': files})
+
+@app.route('/api/upload', methods=['POST'])
+@login_required
+def api_upload():
+    """Upload file from browse folder to Chomikuj"""
     try:
-        if 'file' not in request.files:
-            return json_response({'success': False, 'message': u'Brak pliku w żądaniu'}, 400)
+        data = json.loads(request.data)
+        filepath = data.get('filepath')
+        filename = data.get('filename')
         
-        file = request.files['file']
-        if file.filename == '':
-            return json_response({'success': False, 'message': u'Nie wybrano pliku'}, 400)
+        if not filepath or not filename:
+            return json_response({'success': False, 'message': u'Brak ścieżki do pliku'}, 400)
         
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
-        file.save(filepath)
+        # Verify file exists and is within browse folder
+        if not filepath.startswith(BROWSE_FOLDER):
+            return json_response({'success': False, 'message': u'Nieprawidłowa ścieżka do pliku'}, 400)
+        
+        if not os.path.exists(filepath):
+            return json_response({'success': False, 'message': u'Plik nie istnieje'}, 404)
 
         username = os.environ.get('CHOMIK_USERNAME')
         password = os.environ.get('CHOMIK_PASSWORD')
@@ -784,19 +722,12 @@ def upload():
         if not username or not password:
             return json_response({'success': False, 'message': u'Błąd: Brak konfiguracji CHOMIK_USERNAME lub CHOMIK_PASSWORD'}, 500)
 
-        # Wywołaj chomik CLI
+        # Wywołaj chomik CLI bezpośrednio na pliku z browse folder
         proc = subprocess.Popen([
             "chomik", "-l", username, "-p", password, "-u", dest_path, filepath
         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         
         out, err = proc.communicate()
-        
-        # Usuń plik po uploadzie
-        try:
-            if os.path.exists(filepath):
-                os.remove(filepath)
-        except Exception as e:
-            app.logger.warning('Could not delete file: ' + str(e))
         
         if proc.returncode == 0:
             return json_response({'success': True, 'message': u'Plik przesłany pomyślnie na Chomika!'})
