@@ -1,0 +1,14 @@
+services:
+  chomik-uploader:
+    build: .
+    ports:
+      - "8000:5000"
+    environment:
+      - PANEL_PASSWORD=${PANEL_PASSWORD}
+      - SECRET_KEY=${SECRET_KEY}
+      - CHOMIK_USERNAME=${CHOMIK_USERNAME}
+      - CHOMIK_PASSWORD=${CHOMIK_PASSWORD}
+      - CHOMIK_DEST=/Moje_Uploady
+    volumes:
+      - ./uploads:/app/uploads
+    restart: unless-stopped
