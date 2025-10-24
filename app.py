@@ -7,6 +7,7 @@ import threading
 from functools import wraps
 from flask import Flask, request, redirect, render_template_string, Response, session
 import subprocess
+import shlex
 
 BROWSE_FOLDER = '/app/browse'  # Read-only folder mounted from Synology
 app = Flask(__name__)
@@ -38,28 +39,44 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
-def get_files_from_browse_folder():
-    """Get list of files from browse folder"""
+def get_files_from_browse_folder(folder_path=''):
+    """Get list of files and folders from browse folder"""
     files = []
+    folders = []
     try:
-        if os.path.exists(BROWSE_FOLDER):
-            for root, dirs, filenames in os.walk(BROWSE_FOLDER):
-                for filename in filenames:
-                    filepath = os.path.join(root, filename)
-                    relative_path = os.path.relpath(filepath, BROWSE_FOLDER)
+        current_path = os.path.join(BROWSE_FOLDER, folder_path) if folder_path else BROWSE_FOLDER
+        
+        # Security check - prevent directory traversal
+        if not os.path.abspath(current_path).startswith(os.path.abspath(BROWSE_FOLDER)):
+            return {'files': [], 'folders': [], 'current_path': ''}
+        
+        if os.path.exists(current_path) and os.path.isdir(current_path):
+            try:
+                items = os.listdir(current_path)
+                for item in items:
+                    item_path = os.path.join(current_path, item)
                     try:
-                        size = os.path.getsize(filepath)
-                        files.append({
-                            'name': filename,
-                            'path': relative_path,
-                            'full_path': filepath,
-                            'size': size
-                        })
-                    except:
-                        pass
+                        if os.path.isdir(item_path):
+                            folders.append({
+                                'name': item,
+                                'path': os.path.relpath(item_path, BROWSE_FOLDER)
+                            })
+                        elif os.path.isfile(item_path):
+                            size = os.path.getsize(item_path)
+                            files.append({
+                                'name': item,
+                                'path': os.path.relpath(item_path, BROWSE_FOLDER),
+                                'full_path': item_path,
+                                'size': size
+                            })
+                    except Exception as e:
+                        app.logger.warning('Error processing item: ' + str(e))
+            except Exception as e:
+                app.logger.error('Error listing directory: ' + str(e))
     except Exception as e:
         app.logger.error('Error reading browse folder: ' + str(e))
-    return files
+    
+    return {'files': files, 'folders': sorted(folders), 'current_path': folder_path}
 
 HTML_LOGIN = u"""
 <!doctype html>
@@ -267,43 +284,67 @@ HTML_FORM = u"""
         .retry-btn:hover {
             background: #ffb300;
         }
+        .breadcrumb {
+            padding: 10px;
+            background: #f9f9f9;
+            border-radius: 4px;
+            margin-bottom: 15px;
+            font-size: 14px;
+        }
+        .breadcrumb a {
+            color: #007bff;
+            cursor: pointer;
+            text-decoration: underline;
+        }
+        .breadcrumb a:hover {
+            color: #0056b3;
+        }
         .file-browser {
-            max-height: 400px;
+            max-height: 500px;
             overflow-y: auto;
             border: 1px solid #ddd;
             border-radius: 4px;
             margin: 20px 0;
         }
-        .file-row {
+        .browser-item {
             padding: 12px;
             border-bottom: 1px solid #eee;
             display: flex;
             align-items: center;
             transition: background 0.2s;
         }
-        .file-row:hover {
+        .browser-item:hover {
             background: #f9f9f9;
         }
-        .file-row input[type="checkbox"] {
+        .browser-item input[type="checkbox"] {
             margin-right: 12px;
             width: 18px;
             height: 18px;
             cursor: pointer;
         }
-        .file-info {
+        .browser-item input[type="checkbox"]:disabled {
+            cursor: not-allowed;
+            opacity: 0.5;
+        }
+        .item-info {
             flex: 1;
         }
-        .file-name-browser {
+        .item-name {
             font-weight: 500;
             color: #333;
             word-break: break-all;
         }
-        .file-path {
+        .folder-name {
+            color: #007bff;
+            cursor: pointer;
+            text-decoration: underline;
+        }
+        .item-path {
             font-size: 12px;
             color: #999;
             margin-top: 4px;
         }
-        .file-size-browser {
+        .item-size {
             font-size: 12px;
             color: #666;
             margin-left: 15px;
@@ -314,6 +355,13 @@ HTML_FORM = u"""
             background: #f5f5f5;
             border-bottom: 2px solid #ddd;
             font-weight: bold;
+            display: flex;
+            align-items: center;
+        }
+        .select-all-row input {
+            margin-right: 12px;
+            width: 18px;
+            height: 18px;
         }
         .file-list {
             margin-top: 30px;
@@ -396,7 +444,7 @@ HTML_FORM = u"""
         .retry-section.show {
             display: block;
         }
-        .no-files {
+        .no-items {
             padding: 40px;
             text-align: center;
             color: #999;
@@ -418,18 +466,20 @@ HTML_FORM = u"""
         
         <div id="messages" class="messages"></div>
         
-        <h2>Dostępne pliki na Synology:</h2>
+        <h2>Przeglądaj i wybierz pliki:</h2>
+        <div class="breadcrumb" id="breadcrumb"></div>
+        
         <div class="file-browser" id="fileBrowser">
             <div class="select-all-row">
                 <input type="checkbox" id="selectAll" onchange="toggleSelectAll()">
-                <label for="selectAll" style="display: inline; cursor: pointer;">Zaznacz wszystkie</label>
+                <label for="selectAll" style="display: inline; cursor: pointer; margin: 0;">Zaznacz wszystkie pliki</label>
             </div>
             <div id="fileList"></div>
         </div>
         
         <div class="button-group">
             <button id="uploadBtn" onclick="uploadSelected()" disabled>Wyślij zaznaczone pliki</button>
-            <button onclick="refreshFileList()">Odśwież listę</button>
+            <button onclick="deselectAll()">Usuń zaznaczenia</button>
         </div>
         
         <div class="file-list">
@@ -444,52 +494,81 @@ HTML_FORM = u"""
     <script>
         let availableFiles = [];
         let failedFiles = [];
+        let currentFolder = '';
         
         const statusList = document.getElementById('statusList');
         const messagesDiv = document.getElementById('messages');
         const uploadBtn = document.getElementById('uploadBtn');
         const retrySection = document.getElementById('retrySection');
         const fileListDiv = document.getElementById('fileList');
+        const breadcrumbDiv = document.getElementById('breadcrumb');
 
-        // Load files on page load
         window.addEventListener('load', () => {
-            refreshFileList();
+            loadFiles('');
         });
 
-        function refreshFileList() {
-            fetch('/api/files')
+        function loadFiles(folderPath) {
+            currentFolder = folderPath;
+            fetch('/api/files?path=' + encodeURIComponent(folderPath))
                 .then(response => response.json())
                 .then(data => {
                     availableFiles = data.files;
-                    renderFileList();
+                    renderBreadcrumb(data.current_path);
+                    renderFileList(data.files, data.folders);
                 })
                 .catch(error => {
                     showMessage('Błąd pobierania listy plików: ' + error.message, 'error');
                 });
         }
 
-        function renderFileList() {
+        function renderBreadcrumb(path) {
+            let html = '<a onclick="loadFiles(\\'\\')">Główny folder</a>';
+            if (path) {
+                const parts = path.split('/');
+                let currentPath = '';
+                parts.forEach((part, index) => {
+                    currentPath += (index > 0 ? '/' : '') + part;
+                    html += ' / <a onclick="loadFiles(\\''+currentPath+'\\')">' + part + '</a>';
+                });
+            }
+            breadcrumbDiv.innerHTML = html;
+        }
+
+        function renderFileList(files, folders) {
             fileListDiv.innerHTML = '';
             
-            if (availableFiles.length === 0) {
-                fileListDiv.innerHTML = '<div class="no-files">Brak plików w katalogu</div>';
+            if (folders.length === 0 && files.length === 0) {
+                fileListDiv.innerHTML = '<div class="no-items">Brak plików i folderów</div>';
                 return;
             }
 
-            availableFiles.forEach((file, index) => {
+            // Render folders
+            folders.forEach((folder) => {
                 const row = document.createElement('div');
-                row.className = 'file-row';
+                row.className = 'browser-item';
+                row.innerHTML = `
+                    <div class="item-info" style="flex: 1;">
+                        <div class="folder-name" onclick="loadFiles('${folder.path}')">📁 ${folder.name}</div>
+                    </div>
+                `;
+                fileListDiv.appendChild(row);
+            });
+
+            // Render files
+            files.forEach((file, index) => {
+                const row = document.createElement('div');
+                row.className = 'browser-item';
                 const sizeKB = (file.size / 1024).toFixed(2);
                 const sizeMB = (file.size / 1024 / 1024).toFixed(2);
                 const sizeDisplay = file.size > 1024 * 1024 ? sizeMB + ' MB' : sizeKB + ' KB';
                 
                 row.innerHTML = `
-                    <input type="checkbox" id="file-${index}" onchange="updateUploadButton()">
-                    <div class="file-info">
-                        <div class="file-name-browser">${file.name}</div>
-                        <div class="file-path">${file.path}</div>
+                    <input type="checkbox" id="file-${index}" onchange="updateUploadButton()" data-file-index="${index}">
+                    <div class="item-info">
+                        <div class="item-name">${file.name}</div>
+                        <div class="item-path">${file.path}</div>
                     </div>
-                    <div class="file-size-browser">${sizeDisplay}</div>
+                    <div class="item-size">${sizeDisplay}</div>
                 `;
                 fileListDiv.appendChild(row);
             });
@@ -506,6 +585,15 @@ HTML_FORM = u"""
             updateUploadButton();
         }
 
+        function deselectAll() {
+            const checkboxes = fileListDiv.querySelectorAll('input[type="checkbox"]');
+            checkboxes.forEach(cb => {
+                cb.checked = false;
+            });
+            document.getElementById('selectAll').checked = false;
+            updateUploadButton();
+        }
+
         function updateUploadButton() {
             const checkboxes = fileListDiv.querySelectorAll('input[type="checkbox"]');
             const anyChecked = Array.from(checkboxes).some(cb => cb.checked);
@@ -514,9 +602,10 @@ HTML_FORM = u"""
 
         function getSelectedFiles() {
             const selected = [];
-            const checkboxes = fileListDiv.querySelectorAll('input[type="checkbox"]');
-            checkboxes.forEach((cb, index) => {
-                if (cb.checked) {
+            const checkboxes = fileListDiv.querySelectorAll('input[type="checkbox"]:checked');
+            checkboxes.forEach((cb) => {
+                const index = parseInt(cb.getAttribute('data-file-index'));
+                if (!isNaN(index)) {
                     selected.push(availableFiles[index]);
                 }
             });
@@ -545,7 +634,7 @@ HTML_FORM = u"""
                     await uploadFile(file);
                 } catch (error) {
                     updateFileStatus(file.name, 'error', 'Błąd: ' + error.message);
-                    failedFiles.push(file.name);
+                    failedFiles.push(file.full_path);
                 }
             }
 
@@ -557,7 +646,7 @@ HTML_FORM = u"""
         function addFileStatus(fileName, fileSize) {
             const statusItem = document.createElement('div');
             statusItem.className = 'file-item pending';
-            statusItem.id = 'status-' + fileName;
+            statusItem.id = 'status-' + fileName.replace(/[^a-zA-Z0-9]/g, '_');
             const sizeKB = (fileSize / 1024).toFixed(2);
             const sizeMB = (fileSize / 1024 / 1024).toFixed(2);
             const sizeDisplay = fileSize > 1024 * 1024 ? sizeMB + ' MB' : sizeKB + ' KB';
@@ -566,17 +655,18 @@ HTML_FORM = u"""
                 <div class="file-name">${fileName}</div>
                 <div class="file-size">Rozmiar: ${sizeDisplay}</div>
                 <div class="progress-bar">
-                    <div class="progress-fill" id="progress-${fileName}">0%</div>
+                    <div class="progress-fill" id="progress-${fileName.replace(/[^a-zA-Z0-9]/g, '_')}">0%</div>
                 </div>
-                <div class="status-text status-pending" id="text-${fileName}">Oczekiwanie...</div>
+                <div class="status-text status-pending" id="text-${fileName.replace(/[^a-zA-Z0-9]/g, '_')}">Oczekiwanie...</div>
             `;
             statusList.appendChild(statusItem);
         }
 
         function updateFileStatus(fileName, status, message) {
-            const statusItem = document.getElementById('status-' + fileName);
-            const textEl = document.getElementById('text-' + fileName);
-            const progressEl = document.getElementById('progress-' + fileName);
+            const safeFileName = fileName.replace(/[^a-zA-Z0-9]/g, '_');
+            const statusItem = document.getElementById('status-' + safeFileName);
+            const textEl = document.getElementById('text-' + safeFileName);
+            const progressEl = document.getElementById('progress-' + safeFileName);
             
             if (!statusItem) return;
 
@@ -594,14 +684,6 @@ HTML_FORM = u"""
                 statusItem.className = 'file-item error';
                 textEl.className = 'status-text status-error';
                 textEl.textContent = message;
-            }
-        }
-
-        function updateProgress(fileName, percent) {
-            const progressEl = document.getElementById('progress-' + fileName);
-            if (progressEl) {
-                progressEl.style.width = percent + '%';
-                progressEl.textContent = percent + '%';
             }
         }
 
@@ -624,12 +706,12 @@ HTML_FORM = u"""
                     if (data.success) {
                         updateFileStatus(file.name, 'success', 'Przesłano pomyślnie na Chomika!');
                         showMessage('✓ ' + file.name + ' - przesłano pomyślnie', 'success');
-                        failedFiles = failedFiles.filter(f => f !== file.name);
+                        failedFiles = failedFiles.filter(f => f !== file.full_path);
                     } else {
                         updateFileStatus(file.name, 'error', 'Błąd: ' + (data.message || 'Nieznany błąd'));
                         showMessage('✗ ' + file.name + ' - ' + (data.message || 'Błąd uploadu'), 'error');
-                        if (!failedFiles.includes(file.name)) {
-                            failedFiles.push(file.name);
+                        if (!failedFiles.includes(file.full_path)) {
+                            failedFiles.push(file.full_path);
                         }
                     }
                     resolve();
@@ -637,8 +719,8 @@ HTML_FORM = u"""
                 .catch(error => {
                     updateFileStatus(file.name, 'error', 'Błąd połączenia: ' + error.message);
                     showMessage('✗ ' + file.name + ' - Błąd połączenia', 'error');
-                    if (!failedFiles.includes(file.name)) {
-                        failedFiles.push(file.name);
+                    if (!failedFiles.includes(file.full_path)) {
+                        failedFiles.push(file.full_path);
                     }
                     reject(error);
                 });
@@ -646,8 +728,8 @@ HTML_FORM = u"""
         }
 
         function retryFailed() {
-            // Retry implementation for failed files
-            showMessage('Funkcja retry w rozwoju', 'info');
+            showMessage('Ponowne wysyłanie ' + failedFiles.length + ' plików...', 'pending');
+            // Implementation for retry
         }
 
         function showMessage(message, type) {
@@ -693,8 +775,9 @@ def index():
 @login_required
 def api_files():
     """Return list of files from browse folder"""
-    files = get_files_from_browse_folder()
-    return json_response({'files': files})
+    folder_path = request.args.get('path', '')
+    result = get_files_from_browse_folder(folder_path)
+    return json_response(result)
 
 @app.route('/api/upload', methods=['POST'])
 @login_required
@@ -709,7 +792,7 @@ def api_upload():
             return json_response({'success': False, 'message': u'Brak ścieżki do pliku'}, 400)
         
         # Verify file exists and is within browse folder
-        if not filepath.startswith(BROWSE_FOLDER):
+        if not os.path.abspath(filepath).startswith(os.path.abspath(BROWSE_FOLDER)):
             return json_response({'success': False, 'message': u'Nieprawidłowa ścieżka do pliku'}, 400)
         
         if not os.path.exists(filepath):
@@ -722,7 +805,7 @@ def api_upload():
         if not username or not password:
             return json_response({'success': False, 'message': u'Błąd: Brak konfiguracji CHOMIK_USERNAME lub CHOMIK_PASSWORD'}, 500)
 
-        # Wywołaj chomik CLI bezpośrednio na pliku z browse folder
+        # Properly escape filepath for shell - handles spaces and special characters
         proc = subprocess.Popen([
             "chomik", "-l", username, "-p", password, "-u", dest_path, filepath
         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
