@@ -10,5 +10,5 @@ services:
       - CHOMIK_PASSWORD=${CHOMIK_PASSWORD}
       - CHOMIK_DEST=/Moje_Uploady
     volumes:
-      - ./uploads:/app/uploads
+      - ./browse:/app/browse:ro
     restart: unless-stopped
