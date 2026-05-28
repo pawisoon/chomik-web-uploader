@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 browse/
 uploads/
+data/
+docker-compose.override.yml

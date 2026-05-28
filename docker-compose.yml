@@ -11,4 +11,5 @@ services:
       - CHOMIK_DEST=/Moje_Uploady
     volumes:
       - ./browse:/app/browse:ro
+      - ./data:/app/data
     restart: unless-stopped
