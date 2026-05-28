@@ -398,7 +398,13 @@ HTML_FORM = """
         </div>
 
         <div class="file-list">
-            <h2>Status uploadów:</h2>
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-top:30px;margin-bottom:15px">
+                <h2 style="margin:0">Status uploadów:</h2>
+                <div>
+                    <button type="button" onclick="clearCompleted()" style="background:#6c757d;font-size:13px;padding:6px 12px;margin:0">Wyczyść ukończone</button>
+                    <button type="button" onclick="clearAll()" style="background:#6c757d;font-size:13px;padding:6px 12px;margin:0 0 0 4px">Wyczyść wszystko</button>
+                </div>
+            </div>
             <div id="statusList"></div>
             <div id="retrySection" class="retry-section">
                 <button type="button" onclick="retryFailed()" class="retry-btn">Spróbuj wysłać ponownie pliki, które się nie powiodły</button>
@@ -656,6 +662,21 @@ HTML_FORM = """
 
         function retryFailed() {
             showMessage('Ponowne wysyłanie ' + failedFiles.length + ' plików...', 'pending');
+        }
+
+        function clearCompleted() {
+            statusList.querySelectorAll('.file-item.success').forEach(el => el.remove());
+            messagesDiv.querySelectorAll('.alert').forEach(el => {
+                if (el.textContent.indexOf('✗') === -1) el.remove();
+            });
+            if (!statusList.querySelector('.file-item.error')) retrySection.classList.remove('show');
+        }
+
+        function clearAll() {
+            statusList.innerHTML = '';
+            messagesDiv.innerHTML = '';
+            failedFiles = [];
+            retrySection.classList.remove('show');
         }
 
         async function uploadFolder(folderPath, folderName) {
