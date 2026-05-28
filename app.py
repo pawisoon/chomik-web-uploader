@@ -2,6 +2,7 @@ import os
 import json
 import hashlib
 import hmac
+import sqlite3
 import threading
 import time
 import uuid
@@ -11,6 +12,7 @@ from flask import Flask, request, redirect, render_template_string, Response, se
 from chomik import ChomikUploader
 
 BROWSE_FOLDER = '/app/browse'
+HISTORY_DB = os.environ.get('UPLOAD_HISTORY_DB', '/app/data/upload_history.db')
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'default-secret-key-change-me')
 
@@ -22,10 +24,68 @@ if PANEL_PASSWORD and not PASSWORD_HASH:
 
 upload_status = {}
 upload_lock = threading.Lock()
+history_lock = threading.Lock()
 
 STATUS_TTL_SECONDS = 600
 PROGRESS_THROTTLE_BYTES = 262144  # 256 KB
 PROGRESS_THROTTLE_SECONDS = 0.25
+
+
+def _history_init():
+    db_dir = os.path.dirname(HISTORY_DB)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+    with sqlite3.connect(HISTORY_DB) as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS uploads(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            abs_path TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            dest_path TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime REAL NOT NULL,
+            finished_at REAL NOT NULL,
+            UNIQUE(abs_path, dest_path, size, mtime))""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_lookup ON uploads(abs_path, dest_path)")
+
+
+def _history_is_uploaded(abs_path, dest_path, size, mtime):
+    try:
+        with history_lock, sqlite3.connect(HISTORY_DB) as c:
+            row = c.execute(
+                "SELECT 1 FROM uploads WHERE abs_path=? AND dest_path=? AND size=? AND mtime=?",
+                (abs_path, dest_path, size, mtime),
+            ).fetchone()
+        return row is not None
+    except sqlite3.Error:
+        return False
+
+
+def _history_any_uploaded(abs_path, size, mtime):
+    try:
+        with history_lock, sqlite3.connect(HISTORY_DB) as c:
+            row = c.execute(
+                "SELECT 1 FROM uploads WHERE abs_path=? AND size=? AND mtime=? LIMIT 1",
+                (abs_path, size, mtime),
+            ).fetchone()
+        return row is not None
+    except sqlite3.Error:
+        return False
+
+
+def _history_record(abs_path, filename, dest_path, size, mtime):
+    try:
+        with history_lock, sqlite3.connect(HISTORY_DB) as c:
+            c.execute(
+                """INSERT OR IGNORE INTO uploads
+                (abs_path, filename, dest_path, size, mtime, finished_at)
+                VALUES (?,?,?,?,?,?)""",
+                (abs_path, filename, dest_path, size, mtime, time.time()),
+            )
+    except sqlite3.Error as e:
+        app.logger.warning('History record failed: ' + str(e))
+
+
+_history_init()
 
 
 def verify_password(password):
@@ -146,6 +206,28 @@ def _run_upload(upload_id, filepath, filename, username, password, dest_path):
                     rec['status'] = 'uploading'
 
     try:
+        try:
+            size = os.path.getsize(filepath)
+            mtime = os.path.getmtime(filepath)
+        except OSError as e:
+            with upload_lock:
+                rec = upload_status.get(upload_id)
+                if rec is not None:
+                    rec['status'] = 'error'
+                    rec['message'] = 'File stat failed: ' + str(e)
+                    rec['finished_at'] = time.time()
+            return
+
+        if _history_is_uploaded(filepath, dest_path, size, mtime):
+            with upload_lock:
+                rec = upload_status.get(upload_id)
+                if rec is not None:
+                    rec['status'] = 'success'
+                    rec['bytes_sent'] = rec['total_bytes']
+                    rec['message'] = 'Already uploaded (cached)'
+                    rec['finished_at'] = time.time()
+            return
+
         uploader = ChomikUploader(username, password)
         if not uploader.login():
             with upload_lock:
@@ -171,6 +253,8 @@ def _run_upload(upload_id, filepath, filename, username, password, dest_path):
             else:
                 rec['status'] = 'error'
                 rec['message'] = err or 'Upload failed'
+        if ok:
+            _history_record(filepath, filename, dest_path, size, mtime)
     except Exception as e:
         with upload_lock:
             rec = upload_status.get(upload_id)
@@ -191,11 +275,7 @@ def _run_batch_upload(files_info, username, password, base_dest_path):
                     rec['finished_at'] = time.time()
 
     try:
-        uploader = ChomikUploader(username, password)
-        if not uploader.login():
-            _fail_all('Authentication with Chomikuj failed')
-            return
-
+        uploader = None
         for fi in files_info:
             upload_id = fi['upload_id']
             filepath = fi['full_path']
@@ -203,6 +283,34 @@ def _run_batch_upload(files_info, username, password, base_dest_path):
             rel_dir = fi['relative_dir']
 
             dest = (base_dest_path.rstrip('/') + '/' + rel_dir) if rel_dir else base_dest_path
+
+            try:
+                size = os.path.getsize(filepath)
+                mtime = os.path.getmtime(filepath)
+            except OSError as e:
+                with upload_lock:
+                    rec = upload_status.get(upload_id)
+                    if rec is not None:
+                        rec['status'] = 'error'
+                        rec['message'] = 'File stat failed: ' + str(e)
+                        rec['finished_at'] = time.time()
+                continue
+
+            if _history_is_uploaded(filepath, dest, size, mtime):
+                with upload_lock:
+                    rec = upload_status.get(upload_id)
+                    if rec is not None:
+                        rec['status'] = 'success'
+                        rec['bytes_sent'] = rec['total_bytes']
+                        rec['message'] = 'Already uploaded (cached)'
+                        rec['finished_at'] = time.time()
+                continue
+
+            if uploader is None:
+                uploader = ChomikUploader(username, password)
+                if not uploader.login():
+                    _fail_all('Authentication with Chomikuj failed')
+                    return
 
             last_progress = {'bytes': 0, 'time': 0.0}
 
@@ -234,6 +342,8 @@ def _run_batch_upload(files_info, username, password, base_dest_path):
                     else:
                         rec['status'] = 'error'
                         rec['message'] = err or 'Upload failed'
+                if ok:
+                    _history_record(filepath, filename, dest, size, mtime)
             except Exception as e:
                 with upload_lock:
                     rec = upload_status.get(upload_id)
@@ -361,7 +471,12 @@ HTML_FORM = """
         .status-error { color: #dc3545; }
         .status-pending { color: #ffc107; }
         .messages { margin: 20px 0; }
-        .alert { padding: 12px; margin: 10px 0; border-radius: 4px; border-left: 4px solid #ffc107; background: #fff3cd; color: #856404; }
+        .alert { padding: 12px; margin: 10px 0; border-radius: 4px; border-left: 4px solid #ffc107; background: #fff3cd; color: #856404; transition: opacity 0.4s; }
+        .alert.alert-error { border-left-color: #dc3545; background: #f8d7da; color: #721c24; }
+        .alert.alert-info { border-left-color: #17a2b8; background: #d1ecf1; color: #0c5460; }
+        .alert.fading { opacity: 0; }
+        .upload-counter { padding: 12px 15px; margin: 12px 0; background: #e7f3ff; border-left: 4px solid #007bff; border-radius: 4px; font-weight: bold; font-size: 15px; color: #004085; }
+        .history-badge { display: inline-block; margin-left: 8px; padding: 2px 8px; font-size: 11px; background: #d4edda; color: #155724; border-radius: 10px; font-weight: normal; }
         .retry-section { margin-top: 10px; display: none; }
         .retry-section.show { display: block; }
         .no-items { padding: 40px; text-align: center; color: #999; font-style: italic; }
@@ -405,6 +520,9 @@ HTML_FORM = """
                     <button type="button" onclick="clearAll()" style="background:#6c757d;font-size:13px;padding:6px 12px;margin:0 0 0 4px">Wyczyść wszystko</button>
                 </div>
             </div>
+            <div id="uploadCounter" class="upload-counter" style="display:none">
+                <span id="counterText">0 / 0</span>
+            </div>
             <div id="statusList"></div>
             <div id="retrySection" class="retry-section">
                 <button type="button" onclick="retryFailed()" class="retry-btn">Spróbuj wysłać ponownie pliki, które się nie powiodły</button>
@@ -426,6 +544,20 @@ HTML_FORM = """
         const retrySection = document.getElementById('retrySection');
         const fileListDiv = document.getElementById('fileList');
         const breadcrumbDiv = document.getElementById('breadcrumb');
+        const counterEl = document.getElementById('uploadCounter');
+        const counterText = document.getElementById('counterText');
+
+        let lastUploadContext = null;
+
+        function updateCounter() {
+            const total = statusList.querySelectorAll('.file-item').length;
+            if (!total) { counterEl.style.display = 'none'; return; }
+            const ok = statusList.querySelectorAll('.file-item.success').length;
+            const err = statusList.querySelectorAll('.file-item.error').length;
+            const pending = total - ok - err;
+            counterEl.style.display = 'block';
+            counterText.textContent = `📊 ${ok} / ${total} przesłano • ${err} błędów • ${pending} w toku`;
+        }
 
         window.addEventListener('load', () => loadFiles(''));
 
@@ -480,16 +612,39 @@ HTML_FORM = """
             files.forEach((file, idx) => {
                 const row = document.createElement('div');
                 row.className = 'browser-item';
+                row.dataset.fullPath = file.full_path;
                 const sizeMB = (file.size / 1024 / 1024).toFixed(2);
                 const sizeKB = (file.size / 1024).toFixed(2);
                 const sizeDisplay = file.size > 1024 * 1024 ? sizeMB + ' MB' : sizeKB + ' KB';
                 row.innerHTML = `
                     <input type="checkbox" id="file-${idx}" onchange="updateUploadButton()" data-file-index="${idx}">
-                    <div class="item-info"><div class="item-name">📄 ${escapeHtml(file.name)}</div></div>
+                    <div class="item-info"><div class="item-name">📄 ${escapeHtml(file.name)}<span class="history-badge" style="display:none">✓ już na Chomiku</span></div></div>
                     <div class="item-size">${sizeDisplay}</div>`;
                 fileListDiv.appendChild(row);
             });
             updateUploadButton();
+            checkHistoryBadges(files);
+        }
+
+        function checkHistoryBadges(files) {
+            if (!files || !files.length) return;
+            const paths = files.map(f => f.full_path);
+            fetch('/api/history/check', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({paths: paths})
+            })
+            .then(r => r.json())
+            .then(data => {
+                const set = new Set(data.uploaded || []);
+                fileListDiv.querySelectorAll('.browser-item[data-full-path]').forEach(row => {
+                    if (set.has(row.dataset.fullPath)) {
+                        const badge = row.querySelector('.history-badge');
+                        if (badge) badge.style.display = 'inline-block';
+                    }
+                });
+            })
+            .catch(() => {});
         }
 
         function escapeHtml(t) { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
@@ -527,32 +682,41 @@ HTML_FORM = """
             statusList.innerHTML = '';
             failedFiles = [];
             retrySection.classList.remove('show');
+            lastUploadContext = {kind: 'selected', files: sel.slice()};
             sel.forEach(f => addFileStatus(f.name, f.size));
             for (const file of sel) {
                 try { await uploadFile(file); }
                 catch (e) {
                     updateFileStatus(file.name, 'error', 'Błąd: ' + e.message);
-                    failedFiles.push(file.full_path);
+                    if (!failedFiles.includes(file.full_path)) failedFiles.push(file.full_path);
                 }
             }
             if (failedFiles.length) retrySection.classList.add('show');
+            const total = sel.length;
+            const ok = statusList.querySelectorAll('.file-item.success').length;
+            const err = total - ok;
+            showSummary(total, ok, err);
         }
 
         function safeId(name) { return name.replace(/[^a-zA-Z0-9]/g, '_'); }
 
         function addFileStatus(name, size) {
+            const sid = safeId(name);
+            const existing = document.getElementById('status-' + sid);
+            if (existing) return;
             const item = document.createElement('div');
             item.className = 'file-item pending';
-            item.id = 'status-' + safeId(name);
+            item.id = 'status-' + sid;
             const sizeMB = (size / 1024 / 1024).toFixed(2);
             const sizeKB = (size / 1024).toFixed(2);
             const sd = size > 1024 * 1024 ? sizeMB + ' MB' : sizeKB + ' KB';
             item.innerHTML = `
                 <div class="file-name">${escapeHtml(name)}</div>
                 <div class="file-size">Rozmiar: ${sd}</div>
-                <div class="progress-bar"><div class="progress-fill" id="progress-${safeId(name)}">0%</div></div>
-                <div class="status-text status-pending" id="text-${safeId(name)}">Oczekiwanie...</div>`;
+                <div class="progress-bar"><div class="progress-fill" id="progress-${sid}">0%</div></div>
+                <div class="status-text status-pending" id="text-${sid}">Oczekiwanie...</div>`;
             statusList.appendChild(item);
+            updateCounter();
         }
 
         function updateFileStatus(name, status, message, pct) {
@@ -579,6 +743,7 @@ HTML_FORM = """
                 text.className = 'status-text status-error';
                 text.textContent = message;
             }
+            updateCounter();
         }
 
         function uploadFile(file) {
@@ -594,7 +759,6 @@ HTML_FORM = """
                     if (!data.success || !data.upload_id) {
                         const msg = data.message || 'Nieznany błąd';
                         updateFileStatus(file.name, 'error', 'Błąd: ' + msg);
-                        showMessage('✗ ' + file.name + ' - ' + msg, 'error');
                         if (!failedFiles.includes(file.full_path)) failedFiles.push(file.full_path);
                         resolve();
                         return;
@@ -603,7 +767,6 @@ HTML_FORM = """
                 })
                 .catch(err => {
                     updateFileStatus(file.name, 'error', 'Błąd połączenia');
-                    showMessage('✗ ' + file.name + ' - Błąd połączenia', 'error');
                     if (!failedFiles.includes(file.full_path)) failedFiles.push(file.full_path);
                     resolve();
                 });
@@ -642,14 +805,14 @@ HTML_FORM = """
                                 `Wysyłanie ${sentMB} / ${totMB} MB`, pct);
                         } else if (s.status === 'success') {
                             clearInterval(handle);
-                            updateFileStatus(file.name, 'success', 'Przesłano pomyślnie na Chomika!', 100);
-                            showMessage('✓ ' + file.name + ' - przesłano pomyślnie', 'success');
+                            const msg = (s.message === 'Already uploaded (cached)')
+                                ? 'Już przesłano (cache)' : 'Przesłano pomyślnie na Chomika!';
+                            updateFileStatus(file.name, 'success', msg, 100);
                             failedFiles = failedFiles.filter(p => p !== file.full_path);
                             done();
                         } else if (s.status === 'error') {
                             clearInterval(handle);
                             updateFileStatus(file.name, 'error', 'Błąd: ' + (s.message || 'nieznany'));
-                            showMessage('✗ ' + file.name + ' - ' + (s.message || 'błąd'), 'error');
                             if (!failedFiles.includes(file.full_path)) failedFiles.push(file.full_path);
                             done();
                         }
@@ -660,8 +823,38 @@ HTML_FORM = """
             tick();
         }
 
-        function retryFailed() {
-            showMessage('Ponowne wysyłanie ' + failedFiles.length + ' plików...', 'pending');
+        async function retryFailed() {
+            if (!lastUploadContext) {
+                showMessage('Brak kontekstu do ponowienia', 'error');
+                return;
+            }
+            if (!failedFiles.length) {
+                showMessage('Brak plików do ponowienia', 'info', 3000);
+                return;
+            }
+            const failedSet = new Set(failedFiles);
+            showMessage('Ponowne wysyłanie ' + failedFiles.length + ' plików...', 'info', 4000);
+
+            if (lastUploadContext.kind === 'selected') {
+                const toRetry = lastUploadContext.files.filter(f => failedSet.has(f.full_path));
+                failedFiles = [];
+                retrySection.classList.remove('show');
+                for (const f of toRetry) {
+                    updateFileStatus(f.name, 'uploading', 'Ponowne wysyłanie...', 0);
+                    try { await uploadFile(f); }
+                    catch (e) {
+                        updateFileStatus(f.name, 'error', 'Błąd: ' + e.message);
+                        if (!failedFiles.includes(f.full_path)) failedFiles.push(f.full_path);
+                    }
+                }
+                if (failedFiles.length) retrySection.classList.add('show');
+                const total = lastUploadContext.files.length;
+                const ok = statusList.querySelectorAll('.file-item.success').length;
+                const err = statusList.querySelectorAll('.file-item.error').length;
+                showSummary(total, ok, err);
+            } else if (lastUploadContext.kind === 'folder') {
+                await uploadFolder(lastUploadContext.folderPath, lastUploadContext.folderName, true);
+            }
         }
 
         function clearCompleted() {
@@ -670,6 +863,7 @@ HTML_FORM = """
                 if (el.textContent.indexOf('✗') === -1) el.remove();
             });
             if (!statusList.querySelector('.file-item.error')) retrySection.classList.remove('show');
+            updateCounter();
         }
 
         function clearAll() {
@@ -677,14 +871,22 @@ HTML_FORM = """
             messagesDiv.innerHTML = '';
             failedFiles = [];
             retrySection.classList.remove('show');
+            lastUploadContext = null;
+            updateCounter();
         }
 
-        async function uploadFolder(folderPath, folderName) {
-            messagesDiv.innerHTML = '';
-            statusList.innerHTML = '';
-            failedFiles = [];
-            retrySection.classList.remove('show');
-            showMessage('Skanowanie folderu: ' + folderName + '...', 'pending');
+        async function uploadFolder(folderPath, folderName, isRetry) {
+            if (!isRetry) {
+                messagesDiv.innerHTML = '';
+                statusList.innerHTML = '';
+                failedFiles = [];
+                retrySection.classList.remove('show');
+                lastUploadContext = {kind: 'folder', folderPath: folderPath, folderName: folderName};
+            } else {
+                failedFiles = [];
+                retrySection.classList.remove('show');
+            }
+            showMessage('Skanowanie folderu: ' + folderName + '...', 'info', 3000);
             try {
                 const r = await fetch('/api/upload/folder', {
                     method: 'POST',
@@ -693,33 +895,52 @@ HTML_FORM = """
                 });
                 const data = await r.json();
                 if (!data.success) {
-                    messagesDiv.innerHTML = '';
                     showMessage('Błąd: ' + (data.message || 'Nieznany błąd'), 'error');
                     return;
                 }
                 if (!data.uploads || !data.uploads.length) {
-                    messagesDiv.innerHTML = '';
                     showMessage('Brak plików w folderze', 'error');
                     return;
                 }
-                messagesDiv.innerHTML = '';
-                showMessage('Wysyłanie ' + data.uploads.length + ' pliku(ów) z folderu: ' + folderName, 'pending');
+                showMessage('Wysyłanie ' + data.uploads.length + ' pliku(ów) z folderu: ' + folderName, 'info', 3000);
                 data.uploads.forEach(u => addFileStatus(u.relative_path, u.total_bytes));
                 await Promise.all(data.uploads.map(u => new Promise(resolve => {
                     pollUpload({name: u.relative_path, full_path: u.relative_path}, u.upload_id, resolve);
                 })));
                 if (failedFiles.length) retrySection.classList.add('show');
+                const total = data.uploads.length;
+                const ok = statusList.querySelectorAll('.file-item.success').length;
+                const err = statusList.querySelectorAll('.file-item.error').length;
+                showSummary(total, ok, err);
             } catch(e) {
-                messagesDiv.innerHTML = '';
                 showMessage('Błąd połączenia: ' + e.message, 'error');
             }
         }
 
-        function showMessage(msg, type) {
+        function showMessage(msg, type, ttlMs) {
+            if (type === 'success') return;
             const e = document.createElement('div');
-            e.className = 'alert';
+            e.className = 'alert' + (type === 'error' ? ' alert-error' : (type === 'info' ? ' alert-info' : ''));
             e.textContent = msg;
             messagesDiv.appendChild(e);
+            const fade = (typeof ttlMs === 'number')
+                ? ttlMs
+                : (type === 'error' ? 8000 : 4000);
+            if (fade > 0) {
+                setTimeout(() => { e.classList.add('fading'); }, Math.max(0, fade - 400));
+                setTimeout(() => { if (e.parentNode) e.parentNode.removeChild(e); }, fade);
+            }
+        }
+
+        function showSummary(total, ok, err) {
+            const e = document.createElement('div');
+            e.className = 'alert' + (err > 0 ? ' alert-error' : ' alert-info');
+            e.textContent = `${err > 0 ? '⚠' : '✓'} Zakończono: ${ok}/${total} przesłano, ${err} błędów`;
+            messagesDiv.appendChild(e);
+            if (err === 0) {
+                setTimeout(() => { e.classList.add('fading'); }, 5600);
+                setTimeout(() => { if (e.parentNode) e.parentNode.removeChild(e); }, 6000);
+            }
         }
     </script>
 </body>
@@ -914,6 +1135,36 @@ def api_upload_status(upload_id):
             return json_response({'success': False, 'message': 'Unknown upload_id'}, 404)
         snapshot = dict(rec)
     return json_response(snapshot)
+
+
+@app.route('/api/history/check', methods=['POST'])
+@login_required
+def api_history_check():
+    try:
+        data = json.loads(request.data)
+    except Exception:
+        return json_response({'success': False, 'message': 'Nieprawidłowy JSON'}, 400)
+
+    paths = data.get('paths', [])
+    if not isinstance(paths, list):
+        return json_response({'success': False, 'message': 'paths must be a list'}, 400)
+
+    browse_abs = os.path.abspath(BROWSE_FOLDER)
+    uploaded = []
+    for p in paths:
+        if not isinstance(p, str):
+            continue
+        real = os.path.abspath(p)
+        if not real.startswith(browse_abs):
+            continue
+        try:
+            size = os.path.getsize(real)
+            mtime = os.path.getmtime(real)
+        except OSError:
+            continue
+        if _history_any_uploaded(real, size, mtime):
+            uploaded.append(p)
+    return json_response({'uploaded': uploaded})
 
 
 if __name__ == '__main__':
