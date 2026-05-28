@@ -86,6 +86,37 @@ def get_files_from_browse_folder(folder_path=''):
     }
 
 
+def get_files_recursive(folder_path):
+    results = []
+    abs_folder = os.path.abspath(
+        os.path.join(BROWSE_FOLDER, folder_path) if folder_path else BROWSE_FOLDER
+    )
+    if not abs_folder.startswith(os.path.abspath(BROWSE_FOLDER)):
+        return results
+    if not os.path.isdir(abs_folder):
+        return results
+    for dirpath, dirnames, filenames in os.walk(abs_folder):
+        dirnames.sort()
+        rel_dir = os.path.relpath(dirpath, abs_folder)
+        if rel_dir == '.':
+            rel_dir = ''
+        for fname in sorted(filenames):
+            fpath = os.path.join(dirpath, fname)
+            try:
+                size = os.path.getsize(fpath)
+                rel_path = os.path.join(rel_dir, fname) if rel_dir else fname
+                results.append({
+                    'full_path': fpath,
+                    'filename': fname,
+                    'relative_dir': rel_dir,
+                    'relative_path': rel_path,
+                    'size': size,
+                })
+            except Exception:
+                pass
+    return results
+
+
 def _sweep_status():
     now = time.time()
     with upload_lock:
@@ -147,6 +178,71 @@ def _run_upload(upload_id, filepath, filename, username, password, dest_path):
                 rec['status'] = 'error'
                 rec['message'] = 'Worker exception: ' + str(e)
                 rec['finished_at'] = time.time()
+
+
+def _run_batch_upload(files_info, username, password, base_dest_path):
+    def _fail_all(msg):
+        with upload_lock:
+            for fi in files_info:
+                rec = upload_status.get(fi['upload_id'])
+                if rec and rec['status'] in ('queued', 'uploading'):
+                    rec['status'] = 'error'
+                    rec['message'] = msg
+                    rec['finished_at'] = time.time()
+
+    try:
+        uploader = ChomikUploader(username, password)
+        if not uploader.login():
+            _fail_all('Authentication with Chomikuj failed')
+            return
+
+        for fi in files_info:
+            upload_id = fi['upload_id']
+            filepath = fi['full_path']
+            filename = fi['filename']
+            rel_dir = fi['relative_dir']
+
+            dest = (base_dest_path.rstrip('/') + '/' + rel_dir) if rel_dir else base_dest_path
+
+            last_progress = {'bytes': 0, 'time': 0.0}
+
+            def on_progress(sent, total, uid=upload_id, lp=last_progress):
+                now = time.time()
+                if sent != total and sent - lp['bytes'] < PROGRESS_THROTTLE_BYTES \
+                        and now - lp['time'] < PROGRESS_THROTTLE_SECONDS:
+                    return
+                lp['bytes'] = sent
+                lp['time'] = now
+                with upload_lock:
+                    rec = upload_status.get(uid)
+                    if rec is not None:
+                        rec['bytes_sent'] = sent
+                        if rec['status'] == 'queued':
+                            rec['status'] = 'uploading'
+
+            try:
+                ok, err = uploader.upload_file(filepath, dest, filename=filename, on_progress=on_progress)
+                with upload_lock:
+                    rec = upload_status.get(upload_id)
+                    if rec is None:
+                        continue
+                    rec['finished_at'] = time.time()
+                    if ok:
+                        rec['status'] = 'success'
+                        rec['bytes_sent'] = rec['total_bytes']
+                        rec['message'] = 'Uploaded'
+                    else:
+                        rec['status'] = 'error'
+                        rec['message'] = err or 'Upload failed'
+            except Exception as e:
+                with upload_lock:
+                    rec = upload_status.get(upload_id)
+                    if rec is not None:
+                        rec['status'] = 'error'
+                        rec['message'] = 'Worker exception: ' + str(e)
+                        rec['finished_at'] = time.time()
+    except Exception as e:
+        _fail_all('Batch error: ' + str(e))
 
 
 HTML_LOGIN = """
@@ -363,12 +459,16 @@ HTML_FORM = """
             folders.forEach(folder => {
                 const row = document.createElement('div');
                 row.className = 'browser-item';
+                const safePath = folder.path.replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'");
+                const safeName = folder.name.replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'");
                 row.innerHTML = `
                     <div class="item-info">
                         <div class="folder-name" onclick="loadFiles(\\'${escapeHtml(folder.path)}\\')">
                             📁 ${escapeHtml(folder.name)}
                         </div>
-                    </div>`;
+                    </div>
+                    <button onclick="uploadFolder('${safePath}', '${safeName}')"
+                            style="padding:4px 10px;font-size:13px;margin:0;flex-shrink:0">⬆ Upload</button>`;
                 fileListDiv.appendChild(row);
             });
             files.forEach((file, idx) => {
@@ -558,6 +658,42 @@ HTML_FORM = """
             showMessage('Ponowne wysyłanie ' + failedFiles.length + ' plików...', 'pending');
         }
 
+        async function uploadFolder(folderPath, folderName) {
+            messagesDiv.innerHTML = '';
+            statusList.innerHTML = '';
+            failedFiles = [];
+            retrySection.classList.remove('show');
+            showMessage('Skanowanie folderu: ' + folderName + '...', 'pending');
+            try {
+                const r = await fetch('/api/upload/folder', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({folder_path: folderPath})
+                });
+                const data = await r.json();
+                if (!data.success) {
+                    messagesDiv.innerHTML = '';
+                    showMessage('Błąd: ' + (data.message || 'Nieznany błąd'), 'error');
+                    return;
+                }
+                if (!data.uploads || !data.uploads.length) {
+                    messagesDiv.innerHTML = '';
+                    showMessage('Brak plików w folderze', 'error');
+                    return;
+                }
+                messagesDiv.innerHTML = '';
+                showMessage('Wysyłanie ' + data.uploads.length + ' pliku(ów) z folderu: ' + folderName, 'pending');
+                data.uploads.forEach(u => addFileStatus(u.relative_path, u.total_bytes));
+                await Promise.all(data.uploads.map(u => new Promise(resolve => {
+                    pollUpload({name: u.relative_path, full_path: u.relative_path}, u.upload_id, resolve);
+                })));
+                if (failedFiles.length) retrySection.classList.add('show');
+            } catch(e) {
+                messagesDiv.innerHTML = '';
+                showMessage('Błąd połączenia: ' + e.message, 'error');
+            }
+        }
+
         function showMessage(msg, type) {
             const e = document.createElement('div');
             e.className = 'alert';
@@ -666,6 +802,85 @@ def api_upload():
         'upload_id': upload_id,
         'total_bytes': total_bytes,
         'message': 'Upload started',
+    }, 202)
+
+
+@app.route('/api/upload/folder', methods=['POST'])
+@login_required
+def api_upload_folder():
+    _sweep_status()
+    try:
+        data = json.loads(request.data)
+    except Exception:
+        return json_response({'success': False, 'message': 'Nieprawidłowy JSON'}, 400)
+
+    folder_path = data.get('folder_path', '')
+
+    abs_folder = os.path.abspath(
+        os.path.join(BROWSE_FOLDER, folder_path) if folder_path else BROWSE_FOLDER
+    )
+    browse_abs = os.path.abspath(BROWSE_FOLDER)
+    if not abs_folder.startswith(browse_abs):
+        return json_response({'success': False, 'message': 'Nieprawidłowa ścieżka folderu'}, 400)
+    if not os.path.isdir(abs_folder):
+        return json_response({'success': False, 'message': 'Folder nie istnieje'}, 404)
+
+    username = os.environ.get('CHOMIK_USERNAME')
+    password = os.environ.get('CHOMIK_PASSWORD')
+    chomik_dest = os.environ.get('CHOMIK_DEST', '/Moje_Uploady')
+
+    if not username or not password:
+        return json_response({
+            'success': False,
+            'message': 'Brak konfiguracji CHOMIK_USERNAME lub CHOMIK_PASSWORD',
+        }, 500)
+
+    all_files = get_files_recursive(folder_path)
+    if not all_files:
+        return json_response({'success': False, 'message': 'Brak plików w folderze'}, 400)
+
+    folder_name = os.path.basename(abs_folder)
+    base_dest_path = chomik_dest.rstrip('/') + '/' + folder_name
+
+    files_info = []
+    uploads_response = []
+    now = time.time()
+    with upload_lock:
+        for fi in all_files:
+            uid = uuid.uuid4().hex
+            upload_status[uid] = {
+                'status': 'queued',
+                'bytes_sent': 0,
+                'total_bytes': fi['size'],
+                'filename': fi['relative_path'],
+                'message': 'Queued',
+                'started_at': now,
+                'finished_at': None,
+            }
+            files_info.append({
+                'upload_id': uid,
+                'full_path': fi['full_path'],
+                'filename': fi['filename'],
+                'relative_dir': fi['relative_dir'],
+            })
+            uploads_response.append({
+                'upload_id': uid,
+                'filename': fi['filename'],
+                'relative_path': fi['relative_path'],
+                'total_bytes': fi['size'],
+            })
+
+    t = threading.Thread(
+        target=_run_batch_upload,
+        args=(files_info, username, password, base_dest_path),
+        daemon=True,
+    )
+    t.start()
+
+    return json_response({
+        'success': True,
+        'uploads': uploads_response,
+        'message': f'Batch upload started: {len(files_info)} files',
     }, 202)
 
 
