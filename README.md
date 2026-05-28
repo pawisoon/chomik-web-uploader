@@ -1,6 +1,6 @@
-# ChomikUploader Synology
+# ChomikUploader
 
-ChomikUploader Synology to wygodny, bezpieczny panel webowy do przesyłania plików z Twojego Synology NAS bezpośrednio na konto Chomikuj.pl.
+ChomikUploader to wygodny, bezpieczny panel webowy do przesyłania plików bezpośrednio na konto Chomikuj.pl. Powstał z myślą o Synology NAS, ale uruchomisz go wszędzie tam, gdzie działa Docker (Linux, macOS, Windows, Raspberry Pi, mini PC, VPS).
 
 ## Kluczowe funkcje
 
@@ -11,7 +11,7 @@ ChomikUploader Synology to wygodny, bezpieczny panel webowy do przesyłania plik
 - Przyciski czyszczenia listy statusów (osobno dla ukończonych i osobno dla wszystkich)
 - Pliki są widoczne tylko do odczytu, nie są kopiowane ani zapisywane lokalnie
 - Bezpieczny dostęp chroniony hasłem
-- Działa jako kontener Docker, nie modyfikuje plików na NAS
+- Pojedynczy kontener Docker, działa na Synology, Linuksie, macOS, Windowsie, Raspberry Pi
 
 ---
 
@@ -32,10 +32,14 @@ Postęp dla każdego pliku z osobna, przyciski czyszczenia listy po prawej stron
 
 ---
 
-## Instalacja na Synology NAS
+## Instalacja
 
 ### 1. Przygotuj folder z plikami
-Wybierz lub utwórz katalog na Synology, np. `/volume1/shared`, który chcesz przeglądać i wysyłać pliki z tego miejsca.
+Wybierz katalog, z którego chcesz wysyłać pliki. Może być dowolne miejsce na dysku:
+- Synology: np. `/volume1/shared`
+- Linux/macOS: np. `/home/user/uploads` albo `/Users/janek/movies`
+- Windows: np. `C:/Users/janek/uploads`
+- Raspberry Pi z dyskiem USB: np. `/mnt/usb/media`
 
 ### 2. Stwórz plik `docker-compose.yml`
 
@@ -53,7 +57,7 @@ services:
       - CHOMIK_PASSWORD=twoje_haslo_chomikuj
       - CHOMIK_DEST=/Moje_Uploady
     volumes:
-      - /volume1/shared:/app/browse:ro
+      - /volume1/shared:/app/browse:ro    # podmień na swoją ścieżkę
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
@@ -63,10 +67,10 @@ services:
 - `SECRET_KEY` powinien być długi i losowy (np. `openssl rand -base64 32`)
 - Dane logowania do Chomikuj możesz trzymać w `.env`
 
-### 3. Uruchom przez Portainer lub SSH
+### 3. Uruchom kontener
 
-- **Portainer:** Skopiuj treść `docker-compose.yml`, dodaj stack, uzupełnij zmienne środowiskowe, Deploy
-- **SSH:**
+- **Synology / Portainer:** Skopiuj treść `docker-compose.yml`, dodaj stack, uzupełnij zmienne środowiskowe, Deploy
+- **Wszędzie indziej (SSH/terminal):**
 ```bash
 cd /ścieżka_do_katalogu/
 docker compose up -d
@@ -74,7 +78,7 @@ docker compose up -d
 
 ### 4. Logowanie
 
-- Wejdź na: `http://twoje-nas:8000`
+- Wejdź na `http://adres-twojej-maszyny:8000` (np. `http://twoje-nas:8000` albo `http://localhost:8000` przy uruchomieniu lokalnym)
 - Zaloguj się hasłem panelu
 
 ### 5. Używanie
