@@ -5,10 +5,30 @@ ChomikUploader Synology to wygodny, bezpieczny panel webowy do przesyłania plik
 ## Kluczowe funkcje
 
 - Przeglądanie folderów NAS z nawigacją po katalogach
-- Wybór i wysyłanie plików bezpośrednio na Chomikuj
+- Wybór i wysyłanie pojedynczych plików bezpośrednio na Chomikuj
+- Upload całego folderu razem z podfolderami (struktura zachowana po stronie Chomika)
+- Postęp uploadu na żywo z paskiem postępu dla każdego pliku
+- Przyciski czyszczenia listy statusów (osobno dla ukończonych i osobno dla wszystkich)
 - Pliki są widoczne tylko do odczytu, nie są kopiowane ani zapisywane lokalnie
 - Bezpieczny dostęp chroniony hasłem
 - Działa jako kontener Docker, nie modyfikuje plików na NAS
+
+---
+
+## Zrzuty ekranu
+
+### Logowanie
+![Ekran logowania](docs/screenshots/01-login.png)
+
+### Przeglądarka folderów
+Każdy folder ma przycisk **⬆ Upload**, który wysyła cały folder razem z zawartością.
+
+![Przeglądarka folderów](docs/screenshots/02-browser.png)
+
+### Status uploadów
+Postęp dla każdego pliku z osobna, przyciski czyszczenia listy po prawej stronie.
+
+![Status uploadów](docs/screenshots/03-status.png)
 
 ---
 
@@ -41,7 +61,7 @@ services:
 
 **Uwaga:**
 - `SECRET_KEY` powinien być długi i losowy (np. `openssl rand -base64 32`)
-- Dane logowania do Chomikuj możesz trzymać także w `.env`
+- Dane logowania do Chomikuj możesz trzymać w `.env`
 
 ### 3. Uruchom przez Portainer lub SSH
 
@@ -55,15 +75,17 @@ docker compose up -d
 ### 4. Logowanie
 
 - Wejdź na: `http://twoje-nas:8000`
-- Zaloguj się swoim panelem hasłem
+- Zaloguj się hasłem panelu
 
 ### 5. Używanie
 
-- Przeglądaj foldery jak w eksploratorze Windows/NAS
-- Kliknij folder żeby wejść do niego
-- Zaznacz pliki do wysłania
-- Kliknij „Wyślij zaznaczone pliki”
-- Status uploadu widoczny na żywo
+- Przeglądaj foldery jak w eksploratorze plików, klikaj nazwę żeby wejść do środka
+- Zaznacz checkboxami pojedyncze pliki i kliknij **Wyślij zaznaczone pliki**
+- Albo kliknij **⬆ Upload** obok folderu, żeby wysłać cały folder razem z podfolderami
+- Po stronie Chomika powstanie folder o tej samej nazwie i z tą samą strukturą podfolderów
+- Status uploadu z paskiem postępu pojawia się dla każdego pliku z osobna
+- **Wyczyść ukończone** chowa pomyślnie przesłane wpisy i zostawia błędy
+- **Wyczyść wszystko** czyści cały panel statusów
 
 ---
 
@@ -74,15 +96,18 @@ docker compose up -d
 - Brak zapisywania jakichkolwiek plików w kontenerze
 
 ---
+
 ## FAQ
 - **Błąd portu?** Jeśli 8000 zajęty, zmień na np. "8001:5000" w docker-compose.yml
+- **Folder się nie tworzy na Chomiku?** Sprawdź czy `CHOMIK_DEST` nie zawiera znaków specjalnych. Domyślnie `/Moje_Uploady`
+- **Upload utknął na 0%?** Po stronie Chomika może być chwilowy problem z autoryzacją, restart kontenera zazwyczaj pomaga
 
 ---
 
 ### Autor
 pawisoon
 
-PRy mile widziane! Masz problem lub pytania? Otwórz issue na GitHub.
+PRy mile widziane. Masz problem lub pytania? Otwórz issue na GitHub.
 
 ---
 
