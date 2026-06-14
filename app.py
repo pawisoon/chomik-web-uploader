@@ -509,6 +509,7 @@ HTML_FORM = """
 
         <div>
             <button id="uploadBtn" onclick="uploadSelected()" disabled>Wyślij zaznaczone pliki</button>
+            <button onclick="selectOnlyNew()">Zaznacz tylko nowe</button>
             <button onclick="deselectAll()">Usuń zaznaczenia</button>
         </div>
 
@@ -639,8 +640,11 @@ HTML_FORM = """
                 const set = new Set(data.uploaded || []);
                 fileListDiv.querySelectorAll('.browser-item[data-full-path]').forEach(row => {
                     if (set.has(row.dataset.fullPath)) {
+                        row.dataset.uploaded = "1";
                         const badge = row.querySelector('.history-badge');
                         if (badge) badge.style.display = 'inline-block';
+                    } else {
+                        delete row.dataset.uploaded;
                     }
                 });
             })
@@ -648,6 +652,15 @@ HTML_FORM = """
         }
 
         function escapeHtml(t) { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
+
+        function selectOnlyNew() {
+            fileListDiv.querySelectorAll('.browser-item').forEach(row => {
+                const cb = row.querySelector('input[type="checkbox"]');
+                if (cb) cb.checked = !row.dataset.uploaded;
+            });
+            document.getElementById('selectAll').checked = false;
+            updateUploadButton();
+        }
 
         function toggleSelectAll() {
             const all = document.getElementById('selectAll').checked;
