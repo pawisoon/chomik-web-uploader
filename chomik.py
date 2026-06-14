@@ -186,6 +186,15 @@ class ChomikUploader:
         name = name.strip(". ")
         return name
 
+    def _filename_refinement(self, name):
+        if isinstance(name, bytes):
+            name = name.decode("utf-8", errors="replace")
+        name = name[:256]
+        for c in '\\/:*?"<>|':
+            name = name.replace(c, " ")
+        name = re.sub(r"\s+", " ", name).strip()
+        return name
+
     def _access_node(self, path_parts):
         current_id = "0"
         for part in path_parts:
@@ -285,6 +294,7 @@ class ChomikUploader:
         if not os.path.isfile(local_path):
             return False, "File not found"
         name = filename or os.path.basename(local_path)
+        name = self._filename_refinement(name)
         if not self.chdir(dest_folder_path):
             return False, "Cannot access or create destination folder"
         if not self.login():
