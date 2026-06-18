@@ -57,7 +57,8 @@ services:
       - CHOMIK_PASSWORD=twoje_haslo_chomikuj
       - CHOMIK_DEST=/Moje_Uploady
     volumes:
-      - /volume1/shared:/app/browse:ro    # podmień na swoją ścieżkę
+      - /volume1/shared:/app/browse:ro                   # podmień na swoją ścieżkę
+      - /volume1/docker/chomik-uploader/data:/app/data   # historia uploadów (checksumy) — MUSI być trwały wolumen
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
@@ -66,6 +67,15 @@ services:
 **Uwaga:**
 - `SECRET_KEY` powinien być długi i losowy (np. `openssl rand -base64 32`)
 - Dane logowania do Chomikuj możesz trzymać w `.env`
+- `/app/data` **musi** być na trwałym wolumenie — to tam trzymana jest historia uploadów
+  (checksumy plików), dzięki której panel nie wysyła ponownie raz wgranych plików. Bez tego
+  wolumenu historia znika przy każdym redeployu/restarcie kontenera (np. w Portainerze).
+  Zamiast ścieżki absolutnej możesz użyć nazwanego wolumenu — dodaj `- chomik-data:/app/data`
+  oraz na końcu pliku blok:
+  ```yaml
+  volumes:
+    chomik-data:
+  ```
 
 ### 3. Uruchom kontener
 

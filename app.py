@@ -29,6 +29,7 @@ history_lock = threading.Lock()
 STATUS_TTL_SECONDS = 600
 PROGRESS_THROTTLE_BYTES = 262144  # 256 KB
 PROGRESS_THROTTLE_SECONDS = 0.25
+HASH_CHUNK_SIZE = 65536  # 64 KB
 
 
 def _history_init():
@@ -43,9 +44,22 @@ def _history_init():
             dest_path TEXT NOT NULL,
             size INTEGER NOT NULL,
             mtime REAL NOT NULL,
+            checksum TEXT,
             finished_at REAL NOT NULL,
             UNIQUE(abs_path, dest_path, size, mtime))""")
+        # Migrate pre-checksum DBs created by older versions.
+        cols = [r[1] for r in c.execute("PRAGMA table_info(uploads)").fetchall()]
+        if 'checksum' not in cols:
+            c.execute("ALTER TABLE uploads ADD COLUMN checksum TEXT")
         c.execute("CREATE INDEX IF NOT EXISTS idx_lookup ON uploads(abs_path, dest_path)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_checksum ON uploads(checksum)")
+        # Cache file content hashes so each (path,size,mtime) is hashed at most once.
+        c.execute("""CREATE TABLE IF NOT EXISTS file_hashes(
+            abs_path TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime REAL NOT NULL,
+            checksum TEXT NOT NULL,
+            UNIQUE(abs_path, size, mtime))""")
 
 
 def _history_is_uploaded(abs_path, dest_path, size, mtime):
@@ -72,14 +86,65 @@ def _history_any_uploaded(abs_path, size, mtime):
         return False
 
 
-def _history_record(abs_path, filename, dest_path, size, mtime):
+def _history_checksum_uploaded(checksum):
+    if not checksum:
+        return False
+    try:
+        with history_lock, sqlite3.connect(HISTORY_DB) as c:
+            row = c.execute(
+                "SELECT 1 FROM uploads WHERE checksum=? LIMIT 1",
+                (checksum,),
+            ).fetchone()
+        return row is not None
+    except sqlite3.Error:
+        return False
+
+
+def _file_checksum(abs_path, size, mtime):
+    """sha256 of the file, cached by (abs_path, size, mtime). None on read error."""
+    try:
+        with history_lock, sqlite3.connect(HISTORY_DB) as c:
+            row = c.execute(
+                "SELECT checksum FROM file_hashes WHERE abs_path=? AND size=? AND mtime=?",
+                (abs_path, size, mtime),
+            ).fetchone()
+        if row:
+            return row[0]
+    except sqlite3.Error:
+        pass
+
+    h = hashlib.sha256()
+    try:
+        with open(abs_path, 'rb') as f:
+            while True:
+                chunk = f.read(HASH_CHUNK_SIZE)
+                if not chunk:
+                    break
+                h.update(chunk)
+    except OSError:
+        return None
+    checksum = h.hexdigest()
+
+    try:
+        with history_lock, sqlite3.connect(HISTORY_DB) as c:
+            c.execute(
+                """INSERT OR IGNORE INTO file_hashes (abs_path, size, mtime, checksum)
+                VALUES (?,?,?,?)""",
+                (abs_path, size, mtime, checksum),
+            )
+    except sqlite3.Error:
+        pass
+    return checksum
+
+
+def _history_record(abs_path, filename, dest_path, size, mtime, checksum=None):
     try:
         with history_lock, sqlite3.connect(HISTORY_DB) as c:
             c.execute(
                 """INSERT OR IGNORE INTO uploads
-                (abs_path, filename, dest_path, size, mtime, finished_at)
-                VALUES (?,?,?,?,?,?)""",
-                (abs_path, filename, dest_path, size, mtime, time.time()),
+                (abs_path, filename, dest_path, size, mtime, checksum, finished_at)
+                VALUES (?,?,?,?,?,?,?)""",
+                (abs_path, filename, dest_path, size, mtime, checksum, time.time()),
             )
     except sqlite3.Error as e:
         app.logger.warning('History record failed: ' + str(e))
@@ -228,6 +293,17 @@ def _run_upload(upload_id, filepath, filename, username, password, dest_path):
                     rec['finished_at'] = time.time()
             return
 
+        checksum = _file_checksum(filepath, size, mtime)
+        if _history_checksum_uploaded(checksum):
+            with upload_lock:
+                rec = upload_status.get(upload_id)
+                if rec is not None:
+                    rec['status'] = 'success'
+                    rec['bytes_sent'] = rec['total_bytes']
+                    rec['message'] = 'Already uploaded (duplicate content)'
+                    rec['finished_at'] = time.time()
+            return
+
         uploader = ChomikUploader(username, password)
         if not uploader.login():
             with upload_lock:
@@ -254,7 +330,7 @@ def _run_upload(upload_id, filepath, filename, username, password, dest_path):
                 rec['status'] = 'error'
                 rec['message'] = err or 'Upload failed'
         if ok:
-            _history_record(filepath, filename, dest_path, size, mtime)
+            _history_record(filepath, filename, dest_path, size, mtime, checksum)
     except Exception as e:
         with upload_lock:
             rec = upload_status.get(upload_id)
@@ -306,6 +382,17 @@ def _run_batch_upload(files_info, username, password, base_dest_path):
                         rec['finished_at'] = time.time()
                 continue
 
+            checksum = _file_checksum(filepath, size, mtime)
+            if _history_checksum_uploaded(checksum):
+                with upload_lock:
+                    rec = upload_status.get(upload_id)
+                    if rec is not None:
+                        rec['status'] = 'success'
+                        rec['bytes_sent'] = rec['total_bytes']
+                        rec['message'] = 'Already uploaded (duplicate content)'
+                        rec['finished_at'] = time.time()
+                continue
+
             if uploader is None:
                 uploader = ChomikUploader(username, password)
                 if not uploader.login():
@@ -343,7 +430,7 @@ def _run_batch_upload(files_info, username, password, base_dest_path):
                         rec['status'] = 'error'
                         rec['message'] = err or 'Upload failed'
                 if ok:
-                    _history_record(filepath, filename, dest, size, mtime)
+                    _history_record(filepath, filename, dest, size, mtime, checksum)
             except Exception as e:
                 with upload_lock:
                     rec = upload_status.get(upload_id)
