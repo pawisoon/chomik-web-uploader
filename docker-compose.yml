@@ -11,5 +11,8 @@ services:
       - CHOMIK_DEST=/Moje_Uploady
     volumes:
       - ./browse:/app/browse:ro
+      # Upload history / checksums. Relative paths work for local `docker compose`,
+      # but under Portainer use an absolute host path (e.g. /volume1/docker/chomik-uploader/data)
+      # or a named volume — otherwise the DB is wiped on every redeploy.
       - ./data:/app/data
     restart: unless-stopped
