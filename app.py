@@ -647,7 +647,37 @@ HTML_FORM = """
             counterText.textContent = `📊 ${ok} / ${total} przesłano • ${err} błędów • ${pending} w toku`;
         }
 
-        window.addEventListener('load', () => loadFiles(''));
+        window.addEventListener('load', () => { loadFiles(''); restoreActiveUploads(); });
+
+        function restoreActiveUploads() {
+            fetch('/api/uploads/active')
+                .then(r => r.json())
+                .then(data => {
+                    const ups = data.uploads || [];
+                    ups.forEach(u => {
+                        addFileStatus(u.filename, u.total_bytes);
+                        const pct = u.total_bytes > 0
+                            ? Math.floor(100 * u.bytes_sent / u.total_bytes) : 0;
+                        const fileObj = {name: u.filename, full_path: u.filename};
+                        if (u.status === 'queued' || u.status === 'uploading') {
+                            const sentMB = (u.bytes_sent / 1024 / 1024).toFixed(2);
+                            const totMB  = (u.total_bytes / 1024 / 1024).toFixed(2);
+                            updateFileStatus(u.filename, 'uploading',
+                                `Wysyłanie ${sentMB} / ${totMB} MB`, pct);
+                            pollUpload(fileObj, u.upload_id, () => {});
+                        } else if (u.status === 'success') {
+                            const msg = (u.message === 'Already uploaded (cached)')
+                                ? 'Już przesłano (cache)' : 'Przesłano pomyślnie na Chomika!';
+                            updateFileStatus(u.filename, 'success', msg, 100);
+                        } else if (u.status === 'error') {
+                            updateFileStatus(u.filename, 'error',
+                                'Błąd: ' + (u.message || 'nieznany'));
+                        }
+                    });
+                    updateCounter();
+                })
+                .catch(() => {});
+        }
 
         function loadFiles(folderPath) {
             currentFolder = folderPath;
@@ -1276,6 +1306,25 @@ def api_upload_status(upload_id):
             return json_response({'success': False, 'message': 'Unknown upload_id'}, 404)
         snapshot = dict(rec)
     return json_response(snapshot)
+
+
+@app.route('/api/uploads/active', methods=['GET'])
+@login_required
+def api_uploads_active():
+    _sweep_status()
+    with upload_lock:
+        uploads = [
+            {
+                'upload_id': uid,
+                'status': rec['status'],
+                'bytes_sent': rec['bytes_sent'],
+                'total_bytes': rec['total_bytes'],
+                'filename': rec['filename'],
+                'message': rec['message'],
+            }
+            for uid, rec in upload_status.items()
+        ]
+    return json_response({'uploads': uploads})
 
 
 @app.route('/api/history/check', methods=['POST'])
