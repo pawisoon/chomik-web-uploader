@@ -253,7 +253,7 @@ def _sweep_status():
             upload_status.pop(uid, None)
 
 
-def _run_upload(upload_id, filepath, filename, username, password, dest_path):
+def _run_upload(upload_id, filepath, filename, username, password, dest_path, force=False):
     last_progress = {'bytes': 0, 'time': 0.0}
 
     def on_progress(sent, total):
@@ -283,7 +283,7 @@ def _run_upload(upload_id, filepath, filename, username, password, dest_path):
                     rec['finished_at'] = time.time()
             return
 
-        if _history_is_uploaded(filepath, dest_path, size, mtime):
+        if not force and _history_is_uploaded(filepath, dest_path, size, mtime):
             with upload_lock:
                 rec = upload_status.get(upload_id)
                 if rec is not None:
@@ -294,7 +294,7 @@ def _run_upload(upload_id, filepath, filename, username, password, dest_path):
             return
 
         checksum = _file_checksum(filepath, size, mtime)
-        if _history_checksum_uploaded(checksum):
+        if not force and _history_checksum_uploaded(checksum):
             with upload_lock:
                 rec = upload_status.get(upload_id)
                 if rec is not None:
@@ -340,7 +340,7 @@ def _run_upload(upload_id, filepath, filename, username, password, dest_path):
                 rec['finished_at'] = time.time()
 
 
-def _run_batch_upload(files_info, username, password, base_dest_path):
+def _run_batch_upload(files_info, username, password, base_dest_path, force=False):
     def _fail_all(msg):
         with upload_lock:
             for fi in files_info:
@@ -372,7 +372,7 @@ def _run_batch_upload(files_info, username, password, base_dest_path):
                         rec['finished_at'] = time.time()
                 continue
 
-            if _history_is_uploaded(filepath, dest, size, mtime):
+            if not force and _history_is_uploaded(filepath, dest, size, mtime):
                 with upload_lock:
                     rec = upload_status.get(upload_id)
                     if rec is not None:
@@ -383,7 +383,7 @@ def _run_batch_upload(files_info, username, password, base_dest_path):
                 continue
 
             checksum = _file_checksum(filepath, size, mtime)
-            if _history_checksum_uploaded(checksum):
+            if not force and _history_checksum_uploaded(checksum):
                 with upload_lock:
                     rec = upload_status.get(upload_id)
                     if rec is not None:
@@ -778,14 +778,23 @@ HTML_FORM = """
         async function uploadSelected() {
             const sel = getSelectedFiles();
             if (!sel.length) { showMessage('Nie wybrano żadnych plików', 'error'); return; }
+            let force = false;
+            let cachedCount = 0;
+            fileListDiv.querySelectorAll('input[type="checkbox"]:checked').forEach(cb => {
+                const row = cb.closest('.browser-item');
+                if (row && row.dataset.uploaded) cachedCount++;
+            });
+            if (cachedCount > 0) {
+                force = confirm(cachedCount + ' plik(ów) już przesłano (cache). Wysłać ponownie mimo to?');
+            }
             messagesDiv.innerHTML = '';
             statusList.innerHTML = '';
             failedFiles = [];
             retrySection.classList.remove('show');
-            lastUploadContext = {kind: 'selected', files: sel.slice()};
+            lastUploadContext = {kind: 'selected', files: sel.slice(), force: force};
             sel.forEach(f => addFileStatus(f.name, f.size));
             for (const file of sel) {
-                try { await uploadFile(file); }
+                try { await uploadFile(file, force); }
                 catch (e) {
                     updateFileStatus(file.name, 'error', 'Błąd: ' + e.message);
                     if (!failedFiles.includes(file.full_path)) failedFiles.push(file.full_path);
@@ -846,13 +855,13 @@ HTML_FORM = """
             updateCounter();
         }
 
-        function uploadFile(file) {
+        function uploadFile(file, force) {
             return new Promise((resolve) => {
                 updateFileStatus(file.name, 'uploading', 'Rozpoczynanie...', 0);
                 fetch('/api/upload', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({filepath: file.full_path, filename: file.name})
+                    body: JSON.stringify({filepath: file.full_path, filename: file.name, force: !!force})
                 })
                 .then(r => r.json())
                 .then(data => {
@@ -906,7 +915,10 @@ HTML_FORM = """
                         } else if (s.status === 'success') {
                             clearInterval(handle);
                             const msg = (s.message === 'Already uploaded (cached)')
-                                ? 'Już przesłano (cache)' : 'Przesłano pomyślnie na Chomika!';
+                                ? 'Już przesłano (cache)'
+                                : (s.message === 'Already uploaded (duplicate content)')
+                                ? 'Już przesłano (ta sama treść)'
+                                : 'Przesłano pomyślnie na Chomika!';
                             updateFileStatus(file.name, 'success', msg, 100);
                             failedFiles = failedFiles.filter(p => p !== file.full_path);
                             done();
@@ -941,7 +953,7 @@ HTML_FORM = """
                 retrySection.classList.remove('show');
                 for (const f of toRetry) {
                     updateFileStatus(f.name, 'uploading', 'Ponowne wysyłanie...', 0);
-                    try { await uploadFile(f); }
+                    try { await uploadFile(f, lastUploadContext.force); }
                     catch (e) {
                         updateFileStatus(f.name, 'error', 'Błąd: ' + e.message);
                         if (!failedFiles.includes(f.full_path)) failedFiles.push(f.full_path);
@@ -953,7 +965,7 @@ HTML_FORM = """
                 const err = statusList.querySelectorAll('.file-item.error').length;
                 showSummary(total, ok, err);
             } else if (lastUploadContext.kind === 'folder') {
-                await uploadFolder(lastUploadContext.folderPath, lastUploadContext.folderName, true);
+                await uploadFolder(lastUploadContext.folderPath, lastUploadContext.folderName, true, lastUploadContext.force, true);
             }
         }
 
@@ -975,13 +987,13 @@ HTML_FORM = """
             updateCounter();
         }
 
-        async function uploadFolder(folderPath, folderName, isRetry) {
+        async function uploadFolder(folderPath, folderName, isRetry, force, confirmed) {
             if (!isRetry) {
                 messagesDiv.innerHTML = '';
                 statusList.innerHTML = '';
                 failedFiles = [];
                 retrySection.classList.remove('show');
-                lastUploadContext = {kind: 'folder', folderPath: folderPath, folderName: folderName};
+                lastUploadContext = {kind: 'folder', folderPath: folderPath, folderName: folderName, force: !!force};
             } else {
                 failedFiles = [];
                 retrySection.classList.remove('show');
@@ -991,11 +1003,17 @@ HTML_FORM = """
                 const r = await fetch('/api/upload/folder', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({folder_path: folderPath})
+                    body: JSON.stringify({folder_path: folderPath, force: !!force, confirmed: !!confirmed})
                 });
                 const data = await r.json();
                 if (!data.success) {
                     showMessage('Błąd: ' + (data.message || 'Nieznany błąd'), 'error');
+                    return;
+                }
+                if (data.needs_confirm) {
+                    // Confirm -> re-upload everything (force). Cancel -> upload new, skip cached.
+                    const doForce = confirm(data.cached_count + ' z ' + data.total + ' plik(ów) już przesłano (cache). Wysłać cały folder ponownie? (Anuluj = wyślij tylko nowe)');
+                    await uploadFolder(folderPath, folderName, isRetry, doForce, true);
                     return;
                 }
                 if (!data.uploads || !data.uploads.length) {
@@ -1097,6 +1115,7 @@ def api_upload():
 
     filepath = data.get('filepath')
     filename = data.get('filename')
+    force = bool(data.get('force'))
 
     if not filepath or not filename:
         return json_response({'success': False, 'message': 'Brak ścieżki do pliku'}, 400)
@@ -1134,7 +1153,7 @@ def api_upload():
 
     t = threading.Thread(
         target=_run_upload,
-        args=(upload_id, filepath, filename, username, password, dest_path),
+        args=(upload_id, filepath, filename, username, password, dest_path, force),
         daemon=True,
     )
     t.start()
@@ -1157,6 +1176,8 @@ def api_upload_folder():
         return json_response({'success': False, 'message': 'Nieprawidłowy JSON'}, 400)
 
     folder_path = data.get('folder_path', '')
+    force = bool(data.get('force'))
+    confirmed = bool(data.get('confirmed'))
 
     abs_folder = os.path.abspath(
         os.path.join(BROWSE_FOLDER, folder_path) if folder_path else BROWSE_FOLDER
@@ -1180,6 +1201,26 @@ def api_upload_folder():
     all_files = get_files_recursive(folder_path)
     if not all_files:
         return json_response({'success': False, 'message': 'Brak plików w folderze'}, 400)
+
+    # Pre-flight: warn when some files are already in history so the client can prompt
+    # before we start (cheap path/size/mtime check, no hashing). Skipped once the client
+    # has answered the prompt (confirmed) or is forcing.
+    if not force and not confirmed:
+        cached_count = 0
+        for fi in all_files:
+            try:
+                fp = fi['full_path']
+                if _history_any_uploaded(fp, os.path.getsize(fp), os.path.getmtime(fp)):
+                    cached_count += 1
+            except OSError:
+                continue
+        if cached_count > 0:
+            return json_response({
+                'success': True,
+                'needs_confirm': True,
+                'cached_count': cached_count,
+                'total': len(all_files),
+            })
 
     folder_name = os.path.basename(abs_folder)
     base_dest_path = chomik_dest.rstrip('/') + '/' + folder_name
@@ -1214,7 +1255,7 @@ def api_upload_folder():
 
     t = threading.Thread(
         target=_run_batch_upload,
-        args=(files_info, username, password, base_dest_path),
+        args=(files_info, username, password, base_dest_path, force),
         daemon=True,
     )
     t.start()
